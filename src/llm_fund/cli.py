@@ -11,8 +11,17 @@ from llm_fund.briefing.builder import build_universe_briefing, save_briefing
 from llm_fund.config import AppSettings, ConfigError, load_settings
 from llm_fund.data.loader import DataFreshnessError, PriceLoader
 from llm_fund.data.prices import YFinanceSource
+from llm_fund.delivery.json_out import (
+    render_benchmark_json,
+    render_daily_json,
+    render_monthly_json,
+    render_report_json,
+    render_status_json,
+    render_weekly_json,
+)
 from llm_fund.delivery.report import write_report
-from llm_fund.domain.enums import ExecutionStatus, InstructionStatus
+from llm_fund.delivery.webhook import send_webhook_notification
+from llm_fund.domain.enums import ExecutionStatus, InstructionStatus, ProposalStatus
 from llm_fund.domain.models import Candle, JudgmentResult
 from llm_fund.judgment import prompts
 from llm_fund.judgment.client import (
@@ -186,10 +195,19 @@ def report(
     if stale_messages:
         for message in stale_messages:
             typer.echo(f"[report] stale: {message}", err=True)
+        send_webhook_notification(
+            settings.notify_webhook_url,
+            f"[report] データ鮮度エラー: {'; '.join(stale_messages)}",
+        )
         raise typer.Exit(code=2)
 
     out_path = write_report(settings.report.output_dir, as_of, REPORT_KIND, content_md)
-    typer.echo(f"[report] universes={codes} format={format_} written to {out_path}")
+    send_webhook_notification(settings.notify_webhook_url, content_md)
+    if format_ == "json":
+        payload = render_report_json(codes, out_path, stale_messages)
+        typer.echo(json.dumps(payload, ensure_ascii=False))
+    else:
+        typer.echo(f"[report] universes={codes} format={format_} written to {out_path}")
 
 
 def _build_validation_context(
@@ -284,7 +302,7 @@ def _run_trade_line(
     briefing_id: int,
     briefing_md: str,
     candles_by_symbol: dict[str, list[Candle]],
-) -> str:
+) -> tuple[str, GateDecision]:
     """Judge -> validate -> persist -> render one trade universe's Markdown section."""
     expected = {inst.symbol for inst in settings.universes[code].instruments}
     present = {symbol for symbol, candles in candles_by_symbol.items() if candles}
@@ -321,7 +339,7 @@ def _run_trade_line(
         briefing_id=briefing_id,
         instrument_id_by_symbol=instrument_id_by_symbol,
     )
-    return _render_trade_section(code, gate_decision, disagreement, no_llm=no_llm)
+    return _render_trade_section(code, gate_decision, disagreement, no_llm=no_llm), gate_decision
 
 
 def _render_trade_section(
@@ -368,13 +386,14 @@ def _render_trade_line(
     no_llm: bool,
     briefing_ids: dict[str, int],
     candles_by_code: dict[str, dict[str, list[Candle]]],
-) -> str:
+) -> tuple[str, dict[str, GateDecision]]:
     """Run the trade line for every trade-enabled universe and combine their sections."""
     header = "## 売買判断（Trade Line）\n\n"
     if not trade_codes:
-        return header + "対象ユニバースなし\n"
+        return header + "対象ユニバースなし\n", {}
 
     sections: list[str] = []
+    decisions: dict[str, GateDecision] = {}
     for code in trade_codes:
         candles_by_symbol = candles_by_code.get(code)
         briefing_id = briefing_ids.get(code)
@@ -388,19 +407,19 @@ def _render_trade_line(
         briefing_md = build_universe_briefing(
             code, DAILY_KIND, as_of, candles_by_symbol
         ).content_md
-        sections.append(
-            _run_trade_line(
-                settings,
-                conn,
-                code,
-                as_of,
-                no_llm=no_llm,
-                briefing_id=briefing_id,
-                briefing_md=briefing_md,
-                candles_by_symbol=candles_by_symbol,
-            )
+        section, decision = _run_trade_line(
+            settings,
+            conn,
+            code,
+            as_of,
+            no_llm=no_llm,
+            briefing_id=briefing_id,
+            briefing_md=briefing_md,
+            candles_by_symbol=candles_by_symbol,
         )
-    return header + "\n".join(sections)
+        sections.append(section)
+        decisions[code] = decision
+    return header + "\n".join(sections), decisions
 
 
 @app.command()
@@ -443,9 +462,13 @@ def daily(
     if stale_messages:
         for message in stale_messages:
             typer.echo(f"[daily] stale: {message}", err=True)
+        send_webhook_notification(
+            settings.notify_webhook_url,
+            f"[daily] データ鮮度エラー: {'; '.join(stale_messages)}",
+        )
         raise typer.Exit(code=2)
 
-    trade_md = _render_trade_line(
+    trade_md, trade_decisions = _render_trade_line(
         settings,
         conn,
         trade_codes,
@@ -459,9 +482,17 @@ def daily(
     benchmark_md = _render_benchmark_section(summary)
     full_content = content_md + "\n" + trade_md + "\n" + benchmark_md
     out_path = write_report(settings.report.output_dir, as_of, DAILY_KIND, full_content)
-    typer.echo(
-        f"[daily] date={as_of.isoformat()}, no_llm={no_llm}, format={format_} -> {out_path}"
-    )
+    send_webhook_notification(settings.notify_webhook_url, trade_md)
+    if format_ == "json":
+        typer.echo(
+            json.dumps(
+                render_daily_json(out_path, report_codes, trade_decisions), ensure_ascii=False
+            )
+        )
+    else:
+        typer.echo(
+            f"[daily] date={as_of.isoformat()}, no_llm={no_llm}, format={format_} -> {out_path}"
+        )
 
 
 def _require_llm_settings(settings: AppSettings, command: str) -> anthropic.Anthropic:
@@ -516,8 +547,15 @@ def weekly(
         llm_call_sink=LlmCallRepo(conn),
         audit_sink=AuditEventRepo(conn),
     )
-    typer.echo(render_weekly_result_md(result))
-    typer.echo(f"[weekly] date={as_of.isoformat()} format={format_} no_change={result.no_change}")
+    weekly_md = render_weekly_result_md(result)
+    send_webhook_notification(settings.notify_webhook_url, weekly_md)
+    if format_ == "json":
+        typer.echo(json.dumps(render_weekly_json(result), ensure_ascii=False))
+    else:
+        typer.echo(weekly_md)
+        typer.echo(
+            f"[weekly] date={as_of.isoformat()} format={format_} no_change={result.no_change}"
+        )
 
 
 @app.command()
@@ -557,10 +595,15 @@ def monthly(
         llm_call_sink=LlmCallRepo(conn),
         audit_sink=AuditEventRepo(conn),
     )
-    typer.echo(render_monthly_result_md(result, performance_md))
-    typer.echo(
-        f"[monthly] date={as_of.isoformat()} format={format_} no_change={result.no_change}"
-    )
+    monthly_md = render_monthly_result_md(result, performance_md)
+    send_webhook_notification(settings.notify_webhook_url, monthly_md)
+    if format_ == "json":
+        typer.echo(json.dumps(render_monthly_json(result), ensure_ascii=False))
+    else:
+        typer.echo(monthly_md)
+        typer.echo(
+            f"[monthly] date={as_of.isoformat()} format={format_} no_change={result.no_change}"
+        )
 
 
 @app.command()
@@ -782,11 +825,14 @@ def benchmark(
     as_of = _resolve_as_of(date)
     conn = init_db(settings.db_path)
     summary = _run_tracking(settings, conn, as_of)
-    typer.echo(_render_benchmark_section(summary))
-    typer.echo(
-        f"[benchmark] date={as_of.isoformat()} format={format_} "
-        f"strategies={len(summary.latest_nav)}"
-    )
+    if format_ == "json":
+        typer.echo(json.dumps(render_benchmark_json(summary), ensure_ascii=False))
+    else:
+        typer.echo(_render_benchmark_section(summary))
+        typer.echo(
+            f"[benchmark] date={as_of.isoformat()} format={format_} "
+            f"strategies={len(summary.latest_nav)}"
+        )
 
 
 @app.command()
@@ -850,8 +896,13 @@ def fetch(
 
 
 @app.command()
-def status() -> None:
-    """Display NAV, unrecorded instructions, and instruction/execution deviation (FR-4).
+def status(
+    format_: str = typer.Option(
+        "markdown", "--format", help="Output format: markdown, json"
+    ),
+) -> None:
+    """Display data freshness, NAV, unrecorded instructions, and approval-pending
+    proposals (FR-4, FR-6).
 
     Quick health check before running daily/weekly/monthly cycles.
     """
@@ -892,7 +943,34 @@ def status() -> None:
     if unexecuted_rate is not None:
         lines.append(f"- 未執行率: {unexecuted_rate * 100:.1f}%")
 
-    typer.echo("\n".join(lines))
+    draft_criteria = CriteriaRepo(conn).list_by_status(ProposalStatus.DRAFT.value)
+    draft_policies = PolicyRepo(conn).list_by_status(ProposalStatus.DRAFT.value)
+    proposals = [
+        {"kind": "criteria", "id": c.id, "rationale": c.rationale} for c in draft_criteria
+    ] + [{"kind": "policy", "id": p.id} for p in draft_policies]
+    lines.append(f"- 承認待ちの提案: {len(proposals)}件")
+    for prop in proposals:
+        lines.append(f"  - fund approve {prop['kind']}:{prop['id']}")
+
+    if format_ == "json":
+        typer.echo(
+            json.dumps(
+                render_status_json(
+                    nav=portfolio.nav if portfolio is not None else None,
+                    nav_date=portfolio.state_date.isoformat() if portfolio is not None else None,
+                    cash=portfolio.cash if portfolio is not None else None,
+                    pending_instructions=[
+                        {"ticket_no": inst.ticket_no, "action": inst.action, "units": inst.units}
+                        for inst in pending
+                    ],
+                    unrecorded_proposals=proposals,
+                    unexecuted_rate=unexecuted_rate,
+                ),
+                ensure_ascii=False,
+            )
+        )
+    else:
+        typer.echo("\n".join(lines))
 
 
 if __name__ == "__main__":
