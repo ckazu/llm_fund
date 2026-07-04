@@ -36,10 +36,18 @@ from llm_fund.validator.rules import (
     tse_price_band_width,
     tse_tick_size,
 )
+from tests.factories import (
+    DEFAULT_RATIONALE as LONG_RATIONALE,
+)
+from tests.factories import (
+    build_instrument_context,
+    build_order_plan,
+    build_risk_limits,
+    build_validation_context,
+)
 
 AS_OF = date(2026, 7, 4)
 VALID_UNTIL = date(2026, 7, 7)
-LONG_RATIONALE = "MA25 を上抜け出来高も伴い上昇トレンド継続と判断"
 
 
 def _limits(
@@ -52,7 +60,7 @@ def _limits(
     require_stop_loss: bool = True,
     max_instructions_per_day: int = 5,
 ) -> RiskLimits:
-    return RiskLimits(
+    return build_risk_limits(
         max_loss_per_trade_pct=max_loss_per_trade_pct,
         max_position_pct=max_position_pct,
         max_exposure_pct=max_exposure_pct,
@@ -71,7 +79,7 @@ def _instrument(
     prev_close: float = 3000.0,
     current_units: int = 0,
 ) -> InstrumentContext:
-    return InstrumentContext(
+    return build_instrument_context(
         symbol=symbol,
         in_universe=in_universe,
         lot_size=lot_size,
@@ -89,13 +97,11 @@ def _ctx(
     limits: RiskLimits | None = None,
     data_fresh: bool = True,
 ) -> ValidationContext:
-    if instruments is None:
-        instruments = {"7203.T": _instrument()}
-    return ValidationContext(
+    return build_validation_context(
         nav=nav,
         cash=cash,
         current_exposure=current_exposure,
-        instruments=instruments,
+        instruments=instruments if instruments is not None else {"7203.T": _instrument()},
         limits=limits or _limits(),
         data_fresh=data_fresh,
     )
@@ -111,7 +117,7 @@ def _order(
     sl_price: float = 2900.0,
     rationale: str = LONG_RATIONALE,
 ) -> OrderPlan:
-    return OrderPlan(
+    return build_order_plan(
         symbol=symbol,
         action=action,
         units=units,
@@ -145,9 +151,23 @@ class TestRiskLimitsFromSettings:
         assert limits.max_turnover_pct == 30.0
         assert limits.require_stop_loss is True
         assert limits.max_instructions_per_day == 5
-        # No config field exists for these — they fall back to the absolute cap.
+        # max_loss_per_trade_pct defaults to the absolute cap when not configured;
+        # max_exposure_pct has no config field and always uses the absolute cap.
         assert limits.max_loss_per_trade_pct == ABSOLUTE_MAX_LOSS_PER_TRADE_PCT
         assert limits.max_exposure_pct == ABSOLUTE_MAX_EXPOSURE_PCT
+
+    def test_honours_configured_max_loss_per_trade_below_cap(self) -> None:
+        # A more conservative per-trade loss cap must be settable below the absolute
+        # ceiling (technical-spec.md 6章 MaxLossPerTrade「NAV×設定%（≤絶対上限）」).
+        settings = LimitsSettings(
+            max_position_pct=15.0,
+            max_turnover_pct=30.0,
+            max_instructions_per_day=5,
+            require_stop_loss=True,
+            max_loss_per_trade_pct=1.0,
+        )
+        limits = RiskLimits.from_settings(settings)
+        assert limits.max_loss_per_trade_pct == 1.0
 
     def test_clamps_to_absolute_cap_even_if_config_slips_through(self) -> None:
         # Construct a settings object bypassing its own validator to prove the
@@ -157,10 +177,12 @@ class TestRiskLimitsFromSettings:
             max_turnover_pct=999.0,
             max_instructions_per_day=5,
             require_stop_loss=True,
+            max_loss_per_trade_pct=999.0,
         )
         limits = RiskLimits.from_settings(settings)
         assert limits.max_position_pct == ABSOLUTE_MAX_POSITION_PCT
         assert limits.max_turnover_pct == ABSOLUTE_MAX_TURNOVER_PCT
+        assert limits.max_loss_per_trade_pct == ABSOLUTE_MAX_LOSS_PER_TRADE_PCT
 
 
 class TestStopLossRequired:
@@ -202,6 +224,14 @@ class TestMaxLossPerTrade:
     def test_exit_order_does_not_risk_capital(self) -> None:
         order = _order(action=Action.SELL, entry_price=3301.0, sl_price=3000.0)
         assert rule_max_loss_per_trade(order, _ctx()) is None
+
+    def test_configured_tighter_loss_cap_rejects_order_that_passes_at_default(self) -> None:
+        # (3000-2900)*200 = 20,000. Passes at 3% (=30,000) but a configured 1%
+        # (=10,000) cap must reject it.
+        order = _order(entry_price=3000.0, sl_price=2900.0, units=200)
+        assert rule_max_loss_per_trade(order, _ctx()) is None
+        tight = _ctx(limits=_limits(max_loss_per_trade_pct=1.0))
+        assert rule_max_loss_per_trade(order, tight) is not None
 
 
 class TestCashSufficiency:

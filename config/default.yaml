@@ -5,10 +5,11 @@ llm:
   ratio_only: true
 
 limits:
-  max_position_pct: 15.0      # 1銘柄の組入上限（%）
-  max_turnover_pct: 30.0      # 1回の指示での回転率上限（%）
+  max_position_pct: 15.0        # 1銘柄の組入上限（%。絶対上限25%以下）
+  max_turnover_pct: 30.0        # 1回の指示での回転率上限（%。絶対上限50%以下）
+  max_loss_per_trade_pct: 3.0   # 1指示の想定損失上限（NAV×%。絶対上限3%以下）
   max_instructions_per_day: 5
-  require_stop_loss: true     # SL（損切り）未指定の指示は拒否
+  require_stop_loss: true       # SL（損切り）未指定の指示は拒否
 
 benchmark:
   index_symbol: "1306.T"      # TOPIX連動ETF（積立ベンチマーク）

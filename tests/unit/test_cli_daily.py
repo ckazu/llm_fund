@@ -16,7 +16,13 @@ from typer.testing import CliRunner
 from llm_fund.cli import app
 from llm_fund.domain.models import Candle
 from llm_fund.store.db import init_db
-from llm_fund.store.repos import InstructionRepo, LlmCallRepo, PortfolioStateRepo
+from llm_fund.store.repos import (
+    InstructionRepo,
+    InstrumentRepo,
+    LlmCallRepo,
+    PortfolioStateRepo,
+    PositionRepo,
+)
 
 runner = CliRunner()
 TODAY = date.today()
@@ -128,25 +134,52 @@ class _FakeAnthropic:
         self.messages = _Messages()
 
 
-def _valid_payload() -> dict[str, Any]:
+def _order_payload(
+    *, action: str = "BUY", units: int = 100, symbol: str = "7203.T"
+) -> dict[str, Any]:
     # entry near the stub close (100) so PriceBandSanity/TickSize pass.
+    return {
+        "symbol": symbol,
+        "action": action,
+        "units": units,
+        "entry_price": 110.0,
+        "tp_price": 130.0,
+        "sl_price": 95.0,
+        "valid_days": 3,
+        "rationale": "MA25 上抜けの押し目",
+    }
+
+
+def _payload(*orders: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "market_view": "レンジ上限を試す",
         "no_trade": False,
-        "orders": [
-            {
-                "symbol": "7203.T",
-                "action": "BUY",
-                "units": 100,
-                "entry_price": 110.0,
-                "tp_price": 130.0,
-                "sl_price": 95.0,
-                "valid_days": 3,
-                "rationale": "MA25 上抜けの押し目",
-            }
-        ],
+        "orders": list(orders),
     }
+
+
+def _valid_payload() -> dict[str, Any]:
+    return _payload(_order_payload())
+
+
+def _seed_open_position(
+    db_path: str, *, symbol: str = "7203.T", units: int, avg_cost: float = 100.0
+) -> None:
+    """Seed one open virtual position so daily validation sees a prior-day holding."""
+    conn = init_db(db_path)
+    instrument_repo = InstrumentRepo(conn)
+    record = instrument_repo.get_by_symbol(symbol)
+    instrument_id = (
+        record.id if record is not None else instrument_repo.add(symbol, symbol, "jp")
+    )
+    PositionRepo(conn).add(
+        instrument_id=instrument_id,
+        units=units,
+        avg_cost=avg_cost,
+        opened_at=date(2026, 1, 1),
+        closed_at=None,
+    )
 
 
 class TestDailyNoLlm:
@@ -208,9 +241,12 @@ class TestDailyLlm:
         assert fake.call_count == 3
         assert len(LlmCallRepo(conn2).list_all()) == 3
 
-    def test_llm_buy_without_portfolio_is_rejected(
+    def test_llm_first_day_buy_validates_against_starting_capital(
         self, project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # On the first daily run portfolio_state is unseeded; the gate must fall back to
+        # the configured starting_capital instead of nav=cash=0 (which would reject
+        # every BUY and silently discard the first day's judgment).
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
         fake = _FakeAnthropic(_valid_payload())
@@ -220,7 +256,52 @@ class TestDailyLlm:
 
         assert result.exit_code == 0, result.output
         content = _daily_content(project)
-        # NAV/cash default to 0 without portfolio state -> BUY rejected, no instruction.
+        assert "BUY 7203.T" in content
+        conn = init_db(str(project / "test.db"))
+        ticket = f"{TODAY.strftime('%Y%m%d')}-01"
+        assert InstructionRepo(conn).get_by_ticket_no(ticket) is not None
+
+    def test_llm_sell_of_held_position_validates(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A SELL/CLOSE must be able to validate once a position exists: the gate has to
+        # read held units from `positions`, else ExitWithinHolding rejects every exit.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
+        fake = _FakeAnthropic(_payload(_order_payload(action="SELL", units=100)))
+        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+
+        _seed_open_position(str(project / "test.db"), units=200)
+
+        result = runner.invoke(app, ["daily"])
+
+        assert result.exit_code == 0, result.output
+        content = _daily_content(project)
+        assert "SELL 7203.T" in content
+        conn = init_db(str(project / "test.db"))
+        ticket = f"{TODAY.strftime('%Y%m%d')}-01"
+        stored = InstructionRepo(conn).get_by_ticket_no(ticket)
+        assert stored is not None
+        assert stored.action == "SELL"
+
+    def test_prior_holding_caps_second_day_buy(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A prior-day holding must count toward MaxPositionPct: a fresh 500-unit BUY that
+        # would pass in isolation (~5.5% of NAV) is rejected because 1000 held units are
+        # folded in ((1000+500)*110 = 165,000 > NAV*15% = 150,000).
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
+        fake = _FakeAnthropic(_payload(_order_payload(action="BUY", units=500)))
+        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+
+        _seed_open_position(str(project / "test.db"), units=1000)
+
+        result = runner.invoke(app, ["daily"])
+
+        assert result.exit_code == 0, result.output
+        content = _daily_content(project)
         assert "拒否:" in content
+        assert "MaxPositionPct" in content
         conn = init_db(str(project / "test.db"))
         assert InstructionRepo(conn).count_for_date(TODAY) == 0

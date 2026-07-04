@@ -22,6 +22,7 @@ from llm_fund.judgment.client import (
     gather_consistent_judgment,
     request_judgment,
 )
+from tests.factories import build_llm_judgment_payload, build_llm_order_payload
 
 AS_OF = date(2026, 7, 4)
 
@@ -84,26 +85,13 @@ class _FakeAudit:
 
 
 def _order(symbol: str = "7203.T", action: str = "BUY") -> dict[str, Any]:
-    return {
-        "symbol": symbol,
-        "action": action,
-        "units": 100,
-        "entry_price": 3000.0,
-        "tp_price": 3300.0,
-        "sl_price": 2900.0,
-        "valid_days": 3,
-        "rationale": "上昇トレンド継続と判断",
-    }
+    return build_llm_order_payload(symbol=symbol, action=action)
 
 
 def _payload(orders: list[dict[str, Any]], *, no_trade: bool = False) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "market_view": "レンジ上限を試す展開",
-        "no_trade": no_trade,
-        "no_trade_reason": "様子見" if no_trade else None,
-        "orders": orders,
-    }
+    return build_llm_judgment_payload(
+        orders, no_trade=no_trade, no_trade_reason="様子見" if no_trade else None
+    )
 
 
 def _tool_msg(payload: dict[str, Any]) -> _Message:

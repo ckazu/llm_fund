@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from llm_fund.domain.constants import PERCENT_DIVISOR
 from llm_fund.domain.enums import Action
 from llm_fund.domain.models import OrderPlan
 
@@ -46,7 +47,6 @@ MIN_RATIONALE_LENGTH = 20
 
 # 浮動小数の価格を呼値の整数倍かどうか判定する際の許容誤差。
 _TICK_EPSILON = 1e-9
-_PCT_DIVISOR = 100.0
 
 # --- 東証 呼値テーブル（標準・TOPIX100 以外）---------------------------------
 # (価格の上限[この値以下], 呼値)。先頭から最初に price <= 上限 を満たす行の呼値を使う。
@@ -123,8 +123,11 @@ class RiskLimits:
     """Effective risk limits used by the rules, already clamped to absolute caps.
 
     Build with `from_settings` so the clamping is applied; direct construction is
-    used only in tests. `max_loss_per_trade_pct` and `max_exposure_pct` have no
-    `config` field and always take their absolute cap.
+    used only in tests. `max_position_pct`, `max_turnover_pct` and
+    `max_loss_per_trade_pct` honour their `config` value clamped down to the
+    absolute cap (technical-spec.md 6, 9章「設定%（≤絶対上限）」). `max_exposure_pct`
+    has no `config` field: 現物ロングオンリーでは満額投資（100%）が構造上の上限で、
+    CashSufficiency が実質的に強制するため常に絶対上限を用いる。
     """
 
     max_loss_per_trade_pct: float
@@ -138,7 +141,9 @@ class RiskLimits:
     @classmethod
     def from_settings(cls, settings: "LimitsSettings") -> "RiskLimits":
         return cls(
-            max_loss_per_trade_pct=ABSOLUTE_MAX_LOSS_PER_TRADE_PCT,
+            max_loss_per_trade_pct=min(
+                settings.max_loss_per_trade_pct, ABSOLUTE_MAX_LOSS_PER_TRADE_PCT
+            ),
             max_position_pct=min(settings.max_position_pct, ABSOLUTE_MAX_POSITION_PCT),
             max_exposure_pct=ABSOLUTE_MAX_EXPOSURE_PCT,
             max_turnover_pct=min(settings.max_turnover_pct, ABSOLUTE_MAX_TURNOVER_PCT),
@@ -214,7 +219,7 @@ def rule_max_loss_per_trade(order: OrderPlan, ctx: ValidationContext) -> str | N
     if order.action is not Action.BUY:
         return None
     loss = (order.entry_price - order.sl_price) * order.units
-    limit = ctx.nav * ctx.limits.max_loss_per_trade_pct / _PCT_DIVISOR
+    limit = ctx.nav * ctx.limits.max_loss_per_trade_pct / PERCENT_DIVISOR
     if loss > limit:
         return (
             f"想定損失 {loss:.0f} が上限 {limit:.0f}"
@@ -242,7 +247,7 @@ def rule_max_position_pct(order: OrderPlan, ctx: ValidationContext) -> str | Non
         return None
     post_units = inst.current_units + order.units
     post_value = post_units * order.entry_price
-    limit = ctx.nav * ctx.limits.max_position_pct / _PCT_DIVISOR
+    limit = ctx.nav * ctx.limits.max_position_pct / PERCENT_DIVISOR
     if post_value > limit:
         return (
             f"約定後の組入 {post_value:.0f} が上限 {limit:.0f}"
@@ -256,7 +261,7 @@ def rule_max_exposure(order: OrderPlan, ctx: ValidationContext) -> str | None:
     if order.action is not Action.BUY:
         return None
     post_exposure = ctx.current_exposure + _notional(order)
-    limit = ctx.nav * ctx.limits.max_exposure_pct / _PCT_DIVISOR
+    limit = ctx.nav * ctx.limits.max_exposure_pct / PERCENT_DIVISOR
     if post_exposure > limit:
         return (
             f"約定後の総エクスポージャー {post_exposure:.0f} が上限 {limit:.0f}"

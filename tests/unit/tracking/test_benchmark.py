@@ -11,10 +11,14 @@ from llm_fund.domain.models import Candle
 from llm_fund.store.db import apply_migrations, connect
 from llm_fund.store.repos import (
     BenchmarkNavRepo,
+    BriefingRepo,
     CandleRepo,
+    InstructionRepo,
     InstrumentRepo,
     PortfolioStateRepo,
     StrategyRepo,
+    UniverseRepo,
+    VirtualFillRepo,
 )
 from llm_fund.tracking.benchmark import (
     STRATEGY_FUND,
@@ -220,6 +224,58 @@ class TestRunBenchmark:
         rows = conn.execute("SELECT COUNT(*) AS n FROM benchmark_navs").fetchone()
         # 5 strategies * 2 dates = 10（二重計上しない）
         assert rows["n"] == 10
+
+    def test_fund_cost_and_turnover_reflect_virtual_fills(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # fund の cost_ratio/turnover は virtual_fills の実コスト・実投下代金から算出する
+        # （0 埋めだと対照群だけ有コスト・有回転に見え FR-5 の比較が不公平になる）。
+        self._seed(conn)
+        universe_id = UniverseRepo(conn).add("jp", "jp", trade_enabled=True)
+        instrument_id = InstrumentRepo(conn).get_by_symbol("7203.T").id  # type: ignore[union-attr]
+        briefing_id = BriefingRepo(conn).add(universe_id, date(2026, 1, 3), "daily", "md", "{}")
+        instruction_id = InstructionRepo(conn).add(
+            ticket_no="20260103-01",
+            briefing_id=briefing_id,
+            instrument_id=instrument_id,
+            action="BUY",
+            units=100,
+            entry_price=500.0,
+            tp_price=550.0,
+            sl_price=480.0,
+            valid_until=date(2026, 1, 4),
+            rationale="test",
+            validator_result_json=None,
+            status="pending",
+        )
+        VirtualFillRepo(conn).upsert(
+            instruction_id=instruction_id,
+            fill_date=date(2026, 1, 3),
+            fill_price=500.0,
+            exit_date=None,
+            exit_price=None,
+            exit_reason=None,
+            commission=250.0,
+            slippage=500.0,
+            pnl=None,
+        )
+
+        summary = run_benchmark(
+            conn,
+            date(2026, 1, 4),
+            universe_symbols=["7203.T", "6758.T"],
+            index_symbol="1306.T",
+            momentum_lookback_days=120,
+            random_seed=42,
+            costs=NO_COST,
+            starting_capital=STARTING,
+        )
+
+        fund_metrics = summary.metrics[STRATEGY_FUND]
+        # deployed_notional = 500 * 100 = 50,000 -> turnover = 0.05
+        assert fund_metrics["turnover"] == pytest.approx(50_000.0 / STARTING)
+        # total_cost = 250 + 500 = 750 -> cost_ratio = 0.00075
+        assert fund_metrics["cost_ratio"] == pytest.approx(750.0 / STARTING)
 
     def test_metrics_json_persisted(self, conn: sqlite3.Connection) -> None:
         self._seed(conn)

@@ -21,21 +21,20 @@ from llm_fund.judgment.schemas import (
     LlmJudgment,
     LlmOrderPlan,
 )
+from tests.factories import build_llm_order_payload
 
 AS_OF = date(2026, 7, 4)
 
 
 def _order(**overrides: object) -> dict[str, object]:
-    base: dict[str, object] = {
-        "symbol": "7203.T",
-        "action": "BUY",
-        "units": 100,
-        "entry_price": 3120.0,
-        "tp_price": 3320.0,
-        "sl_price": 3020.0,
-        "valid_days": 3,
-        "rationale": "MA25 上抜けの押し目",
-    }
+    base: dict[str, object] = dict(
+        build_llm_order_payload(
+            entry_price=3120.0,
+            tp_price=3320.0,
+            sl_price=3020.0,
+            rationale="MA25 上抜けの押し目",
+        )
+    )
     base.update(overrides)
     return base
 

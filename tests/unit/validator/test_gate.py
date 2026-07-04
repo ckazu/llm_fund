@@ -33,13 +33,20 @@ from llm_fund.validator.gate import (
 )
 from llm_fund.validator.rules import (
     InstrumentContext,
-    RiskLimits,
     ValidationContext,
+)
+from tests.factories import (
+    DEFAULT_RATIONALE as LONG_RATIONALE,
+)
+from tests.factories import (
+    build_instrument_context,
+    build_order_plan,
+    build_risk_limits,
+    build_validation_context,
 )
 
 AS_OF = date(2026, 7, 4)
 VALID_UNTIL = date(2026, 7, 7)
-LONG_RATIONALE = "MA25 を上抜け出来高も伴い上昇トレンド継続と判断"
 
 
 def _ctx(
@@ -54,23 +61,14 @@ def _ctx(
 ) -> ValidationContext:
     if instruments is None:
         instruments = {
-            "7203.T": InstrumentContext(
-                symbol="7203.T", in_universe=True, lot_size=100, prev_close=2000.0
-            ),
-            "6758.T": InstrumentContext(
-                symbol="6758.T", in_universe=True, lot_size=100, prev_close=2000.0
-            ),
+            "7203.T": build_instrument_context(symbol="7203.T"),
+            "6758.T": build_instrument_context(symbol="6758.T"),
         }
-    limits = RiskLimits(
-        max_loss_per_trade_pct=3.0,
-        max_position_pct=25.0,
-        max_exposure_pct=100.0,
+    limits = build_risk_limits(
         max_turnover_pct=max_turnover_pct,
-        min_rationale_length=20,
-        require_stop_loss=True,
         max_instructions_per_day=max_instructions_per_day,
     )
-    return ValidationContext(
+    return build_validation_context(
         nav=nav,
         cash=cash,
         current_exposure=current_exposure,
@@ -90,7 +88,7 @@ def _order(
     sl_price: float = 1950.0,
     rationale: str = LONG_RATIONALE,
 ) -> OrderPlan:
-    return OrderPlan(
+    return build_order_plan(
         symbol=symbol,
         action=action,
         units=units,
@@ -171,12 +169,8 @@ class TestApplyGateTurnover:
         ]
         # units=50 is not a lot multiple; use lot_size 1 instrument to isolate turnover.
         instruments = {
-            "7203.T": InstrumentContext(
-                symbol="7203.T", in_universe=True, lot_size=100, prev_close=2000.0
-            ),
-            "6758.T": InstrumentContext(
-                symbol="6758.T", in_universe=True, lot_size=1, prev_close=2000.0
-            ),
+            "7203.T": build_instrument_context(symbol="7203.T"),
+            "6758.T": build_instrument_context(symbol="6758.T", lot_size=1),
         }
         decision = apply_gate(orders, _ctx(instruments=instruments), AS_OF)
         assert len(decision.validated) == 2
@@ -230,15 +224,7 @@ class TestApplyGateCumulativeCaps:
 
 
 def _held_instruments(current_units: int) -> dict[str, InstrumentContext]:
-    return {
-        "7203.T": InstrumentContext(
-            symbol="7203.T",
-            in_universe=True,
-            lot_size=100,
-            prev_close=2000.0,
-            current_units=current_units,
-        )
-    }
+    return {"7203.T": build_instrument_context(current_units=current_units)}
 
 
 class TestApplyGateExitWithinHolding:

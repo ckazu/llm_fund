@@ -86,6 +86,31 @@ class TestLoadSettings:
         with pytest.raises(ConfigError):
             load_settings(config_dir=config_dir, env_file=missing_env)
 
+    def test_max_loss_per_trade_pct_over_absolute_cap_is_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_loss_per_trade_pct": 3.1},
+        }
+        _write_yaml(config_dir / "default.yaml", bad)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_configured_max_loss_per_trade_pct_below_cap_loaded(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        ok = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_loss_per_trade_pct": 1.0},
+        }
+        _write_yaml(config_dir / "default.yaml", ok)
+
+        settings = load_settings(config_dir=config_dir, env_file=missing_env)
+
+        assert settings.limits.max_loss_per_trade_pct == 1.0
+
     def test_limit_exactly_at_absolute_cap_is_accepted(
         self, config_dir: Path, missing_env: Path
     ) -> None:

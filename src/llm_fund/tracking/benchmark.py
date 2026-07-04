@@ -32,13 +32,16 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import date
 
+from llm_fund.domain.constants import PERCENT_DIVISOR
 from llm_fund.domain.models import Candle
 from llm_fund.store.repos import (
     BenchmarkNavRepo,
     CandleRepo,
+    InstructionRepo,
     InstrumentRepo,
     PortfolioStateRepo,
     StrategyRepo,
+    VirtualFillRepo,
 )
 from llm_fund.tracking.virtual_fill import CostModel
 
@@ -59,7 +62,6 @@ STRATEGY_NAMES: dict[str, str] = {
 
 # Sharpe 年率換算の営業日数。
 TRADING_DAYS_PER_YEAR = 252
-_PCT = 100.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +190,7 @@ def _max_drawdown_pct(navs: list[float]) -> float:
         if peak > 0:
             drawdown = (nav - peak) / peak
             max_dd = min(max_dd, drawdown)
-    return abs(max_dd) * _PCT
+    return abs(max_dd) * PERCENT_DIVISOR
 
 
 def _sharpe(returns: list[float]) -> float:
@@ -228,6 +230,25 @@ def _load_candles(
         if candles:
             result[symbol] = candles
     return result
+
+
+def _fund_cost_and_notional(conn: sqlite3.Connection) -> tuple[float, float]:
+    """fund（LLM 運用）の実コストと投下代金を virtual_fills から集計する（FR-5 の公平性）。
+
+    total_cost = 全 virtual_fills の手数料＋スリッページ（往復分は各 fill に集約済み）。
+    deployed_notional = 約定した各エントリーの ``fill_price × units`` 合計（対照群の投下代金と
+    同じ「資金を投下した総額」の意味。回転率の分子）。0 埋めではなく実値を用いることで、
+    対照群と同一条件でコスト比率・回転率を比較できるようにする。
+    """
+    units_by_instruction = {i.id: i.units for i in InstructionRepo(conn).list_all()}
+    total_cost = 0.0
+    deployed_notional = 0.0
+    for vf in VirtualFillRepo(conn).list_all():
+        total_cost += vf.commission + vf.slippage
+        if vf.fill_price is not None:
+            units = units_by_instruction.get(vf.instruction_id, 0)
+            deployed_notional += vf.fill_price * units
+    return total_cost, deployed_notional
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,8 +373,13 @@ def run_benchmark(
 
     # --- fund（仮想執行が維持する portfolio_state を参照）---
     if fund_series:
+        # コスト比率・回転率は virtual_fills の実コスト・実投下代金から算出する
+        # （0 埋めにすると対照群だけが有コスト・有回転に見え FR-5 の比較が不公平になる）。
+        fund_cost, fund_notional = _fund_cost_and_notional(conn)
         fund_run = StrategyRun(
-            nav_series=fund_series, total_cost=0.0, deployed_notional=0.0
+            nav_series=fund_series,
+            total_cost=fund_cost,
+            deployed_notional=fund_notional,
         )
         metrics[STRATEGY_FUND] = _persist_series(
             nav_repo, strategy_repo, STRATEGY_FUND, fund_run, starting_capital

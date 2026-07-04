@@ -20,6 +20,7 @@ from llm_fund.judgment.client import (
     DEFAULT_TEMPERATURE,
 )
 from llm_fund.validator.rules import (
+    ABSOLUTE_MAX_LOSS_PER_TRADE_PCT,
     ABSOLUTE_MAX_POSITION_PCT,
     ABSOLUTE_MAX_TURNOVER_PCT,
 )
@@ -71,6 +72,9 @@ class LimitsSettings(BaseModel):
     max_turnover_pct: float
     max_instructions_per_day: int
     require_stop_loss: bool = True
+    # 1指示の想定損失上限（NAV×%）。絶対上限以下で運用者が保守化できる
+    # （technical-spec.md 6章 MaxLossPerTrade「NAV×設定%（≤絶対上限）」）。既定は絶対上限。
+    max_loss_per_trade_pct: float = ABSOLUTE_MAX_LOSS_PER_TRADE_PCT
 
     @model_validator(mode="after")
     def _check_absolute_caps(self) -> "LimitsSettings":
@@ -78,6 +82,15 @@ class LimitsSettings(BaseModel):
             raise ConfigError(
                 f"limits.max_position_pct={self.max_position_pct} exceeds absolute "
                 f"cap {ABSOLUTE_MAX_POSITION_PCT}"
+            )
+        if self.max_loss_per_trade_pct > ABSOLUTE_MAX_LOSS_PER_TRADE_PCT:
+            raise ConfigError(
+                f"limits.max_loss_per_trade_pct={self.max_loss_per_trade_pct} exceeds "
+                f"absolute cap {ABSOLUTE_MAX_LOSS_PER_TRADE_PCT}"
+            )
+        if self.max_loss_per_trade_pct <= 0:
+            raise ConfigError(
+                f"limits.max_loss_per_trade_pct={self.max_loss_per_trade_pct} must be > 0"
             )
         if self.max_turnover_pct > ABSOLUTE_MAX_TURNOVER_PCT:
             raise ConfigError(

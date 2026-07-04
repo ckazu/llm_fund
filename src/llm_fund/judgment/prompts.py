@@ -12,10 +12,10 @@ llm_calls に記録し、ベンチマーク集計をこの単位で期間分離�
 
 from collections.abc import Mapping
 
+from llm_fund.domain.constants import PERCENT_DIVISOR
+
 # プロンプト本文を変更したら必ず上げる。日付.通番 形式。
 PROMPT_VERSION = "2026-07-04.1"
-
-_PCT_DIVISOR = 100.0
 
 # 材料が無いときにタグ内へ入れる明示的なプレースホルダ（空タグにせず「無し」を明示する）。
 _PLACEHOLDER_POLICY = "（有効な月次方針は未設定）"
@@ -61,9 +61,9 @@ def format_portfolio_ratio(
     """
     if nav <= 0:
         return "（ポートフォリオ未初期化: NAV が未設定のため比率を計算できません）"
-    lines = [f"現金比率: {cash / nav * _PCT_DIVISOR:.1f}%"]
+    lines = [f"現金比率: {cash / nav * PERCENT_DIVISOR:.1f}%"]
     for symbol in sorted(holdings):
-        weight = holdings[symbol] / nav * _PCT_DIVISOR
+        weight = holdings[symbol] / nav * PERCENT_DIVISOR
         lines.append(f"{symbol}: {weight:.1f}%")
     if not holdings:
         lines.append("保有ポジション: なし")

@@ -14,6 +14,7 @@ and `adj_close` for indicator math.
 
 from statistics import mean
 
+from llm_fund.domain.constants import PERCENT_DIVISOR
 from llm_fund.domain.models import Candle, IndicatorRow
 
 RETURN_WINDOWS_DAYS = (1, 5, 20, 60)
@@ -23,7 +24,7 @@ VOLUME_WINDOW_DAYS = 20
 
 
 def _pct_change(current: float, base: float) -> float:
-    return (current - base) / base * 100.0
+    return (current - base) / base * PERCENT_DIVISOR
 
 
 def compute_return_pct(closes: list[float], window_days: int) -> float | None:
@@ -75,7 +76,7 @@ def compute_atr_pct(candles: list[Candle], window_days: int = ATR_WINDOW_DAYS) -
             )
         )
     atr = mean(true_ranges)
-    return atr / candles[-1].adj_close * 100.0
+    return atr / candles[-1].adj_close * PERCENT_DIVISOR
 
 
 def compute_volume_ratio(

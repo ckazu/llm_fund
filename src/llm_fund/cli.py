@@ -54,6 +54,7 @@ from llm_fund.store.repos import (
     LlmCallRepo,
     PolicyRepo,
     PortfolioStateRepo,
+    PositionRepo,
     UniverseRecord,
     UniverseRepo,
     price_deviation_pct,
@@ -210,21 +211,64 @@ def report(
         typer.echo(f"[report] universes={codes} format={format_} written to {out_path}")
 
 
+def _portfolio_nav_cash(settings: AppSettings, conn: sqlite3.Connection) -> tuple[float, float]:
+    """(nav, cash) from `portfolio_state`, falling back to starting_capital when uninitialised.
+
+    On the first `fund daily` run the virtual-fill engine has not yet seeded
+    `portfolio_state` (it writes only at the end of the same command), so `latest()`
+    is None. Falling back to the configured `starting_capital` (all cash, no positions)
+    lets the gate validate the first day's BUYs against real capital instead of
+    rejecting them all with nav=cash=0.
+    """
+    portfolio = PortfolioStateRepo(conn).latest()
+    if portfolio is not None:
+        return portfolio.nav, portfolio.cash
+    starting = settings.tracking.starting_capital
+    return starting, starting
+
+
+def _load_open_positions(
+    conn: sqlite3.Connection, candles_by_symbol: dict[str, list[Candle]]
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Read open virtual positions -> (held_units_by_symbol, market_value_by_symbol).
+
+    The virtual-fill engine (S8) is the source of truth for holdings; prior days'
+    open positions live in `positions`. Folding them into the gate/prompt is what
+    makes the absolute MaxPositionPct/MaxExposure caps see cumulative cross-day
+    holdings and lets exit (SELL/CLOSE) instructions validate. Each position is
+    marked to market at its latest available close (matching how the engine values
+    open positions for NAV); when no candle is on hand we fall back to `avg_cost`.
+    """
+    instrument_repo = InstrumentRepo(conn)
+    held_units: dict[str, int] = {}
+    market_value: dict[str, float] = {}
+    for pos in PositionRepo(conn).list_open():
+        record = instrument_repo.get_by_id(pos.instrument_id)
+        if record is None:
+            continue
+        symbol = record.symbol
+        candles = candles_by_symbol.get(symbol)
+        price = candles[-1].close if candles else pos.avg_cost
+        held_units[symbol] = held_units.get(symbol, 0) + pos.units
+        market_value[symbol] = market_value.get(symbol, 0.0) + price * pos.units
+    return held_units, market_value
+
+
 def _build_validation_context(
     settings: AppSettings,
     conn: sqlite3.Connection,
     candles_by_symbol: dict[str, list[Candle]],
     data_fresh: bool,
+    held_units: dict[str, int],
+    current_exposure: float,
 ) -> tuple[ValidationContext, dict[str, int]]:
     """Build a `ValidationContext` + symbol->instrument_id map for the gate.
 
-    NAV/cash come from `portfolio_state` (latest snapshot; 0 when uninitialised, which
-    conservatively rejects every BUY). Positions are unavailable until S8, so held units
-    and current exposure are 0. `prev_close` uses the latest non-adjusted close.
+    NAV/cash and held units/exposure come from the real portfolio state (see
+    `_portfolio_nav_cash` / `_load_open_positions`), so the absolute caps evaluate
+    against cumulative holdings. `prev_close` uses the latest non-adjusted close.
     """
-    portfolio = PortfolioStateRepo(conn).latest()
-    nav = portfolio.nav if portfolio is not None else 0.0
-    cash = portfolio.cash if portfolio is not None else 0.0
+    nav, cash = _portfolio_nav_cash(settings, conn)
 
     instrument_repo = InstrumentRepo(conn)
     instruments: dict[str, InstrumentContext] = {}
@@ -241,13 +285,13 @@ def _build_validation_context(
             in_universe=True,
             lot_size=record.lot_size,
             prev_close=candles[-1].close,
-            current_units=0,
+            current_units=held_units.get(symbol, 0),
         )
 
     ctx = ValidationContext(
         nav=nav,
         cash=cash,
-        current_exposure=0.0,
+        current_exposure=current_exposure,
         instruments=instruments,
         limits=RiskLimits.from_settings(settings.limits),
         data_fresh=data_fresh,
@@ -262,8 +306,13 @@ def _run_judgment(
     briefing_md: str,
     as_of: date,
     briefing_id: int,
+    holdings: dict[str, float],
 ) -> tuple[JudgmentResult, float]:
-    """Run the LLM self-consistency gate and return `(judgment, disagreement_rate)`."""
+    """Run the LLM self-consistency gate and return `(judgment, disagreement_rate)`.
+
+    `holdings` (symbol -> 時価総額) feeds the ratio-based portfolio prompt so the LLM
+    sees its actual open positions (technical-spec.md 5章), not an always-empty book.
+    """
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     config = LlmConfig(
         model=settings.llm.model,
@@ -271,12 +320,10 @@ def _run_judgment(
         max_tokens=settings.judgment.max_tokens,
         n_samples=settings.judgment.n_samples,
     )
-    portfolio = PortfolioStateRepo(conn).latest()
-    nav = portfolio.nav if portfolio is not None else 0.0
-    cash = portfolio.cash if portfolio is not None else 0.0
+    nav, cash = _portfolio_nav_cash(settings, conn)
     user_prompt = prompts.build_user_prompt(
         briefing_md=briefing_md,
-        portfolio_summary=prompts.format_portfolio_ratio(nav, cash, {}),
+        portfolio_summary=prompts.format_portfolio_ratio(nav, cash, holdings),
     )
     decision = gather_consistent_judgment(
         client,
@@ -308,6 +355,11 @@ def _run_trade_line(
     present = {symbol for symbol, candles in candles_by_symbol.items() if candles}
     data_fresh = expected.issubset(present)
 
+    # 現在の仮想ポジション（前日までの保有）を読み、判断プロンプトと検証コンテキストの
+    # 双方に反映する。これにより絶対上限が累積保有を見て、決済指示も検証できる。
+    held_units, market_value = _load_open_positions(conn, candles_by_symbol)
+    current_exposure = sum(market_value.values())
+
     disagreement: float | None = None
     if no_llm:
         judgment: JudgmentResult | None = template_judgment()
@@ -316,11 +368,16 @@ def _run_trade_line(
         judgment = None
     else:
         judgment, disagreement = _run_judgment(
-            settings, conn, briefing_md=briefing_md, as_of=as_of, briefing_id=briefing_id
+            settings,
+            conn,
+            briefing_md=briefing_md,
+            as_of=as_of,
+            briefing_id=briefing_id,
+            holdings=market_value,
         )
 
     ctx, instrument_id_by_symbol = _build_validation_context(
-        settings, conn, candles_by_symbol, data_fresh
+        settings, conn, candles_by_symbol, data_fresh, held_units, current_exposure
     )
     instruction_repo = InstructionRepo(conn)
     if judgment is None:

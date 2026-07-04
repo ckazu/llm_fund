@@ -31,6 +31,7 @@ import json
 from dataclasses import dataclass, field, replace
 from datetime import date
 
+from llm_fund.domain.constants import PERCENT_DIVISOR
 from llm_fund.domain.enums import Action
 from llm_fund.domain.models import OrderPlan, Rejection, ValidatedInstruction
 from llm_fund.store.repos import AuditEventRepo, InstructionRepo
@@ -40,8 +41,6 @@ from llm_fund.validator.rules import (
     ValidationContext,
     notional,
 )
-
-_PCT_DIVISOR = 100.0
 
 AUDIT_KIND_VALIDATED = "instruction_validated"
 AUDIT_KIND_REJECTION = "instruction_rejected"
@@ -74,7 +73,7 @@ def format_ticket_no(as_of: date, sequence: int) -> str:
 def _turnover_reason(
     accumulated: float, this_notional: float, ctx: ValidationContext
 ) -> str | None:
-    limit = ctx.nav * ctx.limits.max_turnover_pct / _PCT_DIVISOR
+    limit = ctx.nav * ctx.limits.max_turnover_pct / PERCENT_DIVISOR
     if accumulated + this_notional > limit:
         return (
             f"{_RULE_MAX_TURNOVER}: 当日回転率が上限 {limit:.0f}"
