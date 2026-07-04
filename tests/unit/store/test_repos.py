@@ -10,6 +10,7 @@ from llm_fund.domain.models import Candle
 from llm_fund.store.db import apply_migrations, connect
 from llm_fund.store.repos import (
     DEFAULT_LOT_SIZE,
+    BriefingRepo,
     CandleRepo,
     InstrumentRepo,
     PortfolioStateRepo,
@@ -181,3 +182,54 @@ class TestPortfolioStateRepo:
     def test_latest_returns_none_when_empty(self, conn: sqlite3.Connection) -> None:
         repo = PortfolioStateRepo(conn)
         assert repo.latest() is None
+
+
+class TestBriefingRepo:
+    def _universe_id(self, conn: sqlite3.Connection) -> int:
+        return UniverseRepo(conn).add("jp_stocks", "jp", report_enabled=True, trade_enabled=True)
+
+    def test_add_and_get_by_id(self, conn: sqlite3.Connection) -> None:
+        universe_id = self._universe_id(conn)
+        repo = BriefingRepo(conn)
+        briefing_id = repo.add(
+            universe_id=universe_id,
+            briefing_date=date(2026, 7, 4),
+            kind="daily",
+            content_md="# briefing",
+            data_snapshot_json='{"foo": 1}',
+        )
+        record = repo.get_by_id(briefing_id)
+        assert record is not None
+        assert record.universe_id == universe_id
+        assert record.briefing_date == date(2026, 7, 4)
+        assert record.kind == "daily"
+        assert record.content_md == "# briefing"
+        assert record.data_snapshot_json == '{"foo": 1}'
+
+    def test_get_by_id_missing_returns_none(self, conn: sqlite3.Connection) -> None:
+        repo = BriefingRepo(conn)
+        assert repo.get_by_id(999) is None
+
+    def test_latest_for_universe_returns_most_recent_date(self, conn: sqlite3.Connection) -> None:
+        universe_id = self._universe_id(conn)
+        repo = BriefingRepo(conn)
+        repo.add(universe_id, date(2026, 7, 1), "daily", "old", "{}")
+        newest_id = repo.add(universe_id, date(2026, 7, 2), "daily", "new", "{}")
+
+        latest = repo.latest_for_universe(universe_id, "daily")
+
+        assert latest is not None
+        assert latest.id == newest_id
+        assert latest.content_md == "new"
+
+    def test_latest_for_universe_filters_by_kind(self, conn: sqlite3.Connection) -> None:
+        universe_id = self._universe_id(conn)
+        repo = BriefingRepo(conn)
+        repo.add(universe_id, date(2026, 7, 4), "weekly", "weekly-content", "{}")
+
+        assert repo.latest_for_universe(universe_id, "daily") is None
+
+    def test_latest_for_universe_returns_none_when_empty(self, conn: sqlite3.Connection) -> None:
+        universe_id = self._universe_id(conn)
+        repo = BriefingRepo(conn)
+        assert repo.latest_for_universe(universe_id, "daily") is None

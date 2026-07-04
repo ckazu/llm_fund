@@ -50,17 +50,24 @@ class Candle(_Frozen):
 
 
 class IndicatorRow(_Frozen):
-    """1銘柄1日分の指標（リターン・移動平均乖離・ATR・出来高比）。"""
+    """1銘柄1日分の指標（リターン・移動平均乖離・ATR・出来高比）。
+
+    割合変化・正規化値のみを持つ（technical-spec.md 5章: LLM は絶対値に過剰反応
+    するため）。算出に必要な日数分のヒストリーが無い項目は `None`（欠損を明示し、
+    無理に0や直近値で埋めない）。
+    """
 
     symbol: str = Field(min_length=1)
     trade_date: date
     close: float = Field(gt=0)
-    return_1d_pct: float
-    return_5d_pct: float
-    return_20d_pct: float
-    ma_deviation_pct: float
-    atr: float = Field(ge=0)
-    volume_ratio: float = Field(ge=0)
+    return_1d_pct: float | None = None
+    return_5d_pct: float | None = None
+    return_20d_pct: float | None = None
+    return_60d_pct: float | None = None
+    ma_deviation_25d_pct: float | None = None
+    ma_deviation_75d_pct: float | None = None
+    atr_pct_14: float | None = None
+    volume_ratio_20d: float | None = None
 
 
 class Briefing(_Frozen):

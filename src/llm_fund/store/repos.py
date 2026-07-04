@@ -1,8 +1,8 @@
 """Repository layer over the SQLite store.
 
-Only the repositories needed by S2 are implemented here (instruments,
-universes, candles, portfolio_state). Instructions/executions/tracking/audit
-repositories are added in later steps as their modules are built.
+S2 added instruments/universes/candles/portfolio_state. S4 adds `BriefingRepo`
+(briefings table) for the report line. Instructions/executions/tracking/audit
+repositories are still added in later steps as their modules are built.
 
 Records returned here are plain frozen dataclasses rather than the pydantic
 domain models in `domain/models.py`: they mirror DB rows (including the
@@ -12,7 +12,7 @@ internal surrogate `id`) and are not part of the LLM/validator data flow that
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 
 from llm_fund.domain.models import Candle
 
@@ -254,4 +254,73 @@ class PortfolioStateRepo:
             cash=row["cash"],
             nav=row["nav"],
             note=row["note"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BriefingRecord:
+    id: int
+    universe_id: int
+    briefing_date: date
+    kind: str
+    content_md: str
+    data_snapshot_json: str
+    created_at: datetime
+
+
+class BriefingRepo:
+    """Write/read for `briefings` (one row per universe/date/kind)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(
+        self,
+        universe_id: int,
+        briefing_date: date,
+        kind: str,
+        content_md: str,
+        data_snapshot_json: str,
+    ) -> int:
+        created_at = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "INSERT INTO briefings "
+            "(universe_id, date, kind, content_md, data_snapshot_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                universe_id,
+                briefing_date.isoformat(),
+                kind,
+                content_md,
+                data_snapshot_json,
+                created_at,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_id(self, briefing_id: int) -> BriefingRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM briefings WHERE id = ?", (briefing_id,)
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def latest_for_universe(self, universe_id: int, kind: str) -> BriefingRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM briefings WHERE universe_id = ? AND kind = ? "
+            "ORDER BY date DESC LIMIT 1",
+            (universe_id, kind),
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> BriefingRecord:
+        return BriefingRecord(
+            id=row["id"],
+            universe_id=row["universe_id"],
+            briefing_date=date.fromisoformat(row["date"]),
+            kind=row["kind"],
+            content_md=row["content_md"],
+            data_snapshot_json=row["data_snapshot_json"],
+            created_at=datetime.fromisoformat(row["created_at"]),
         )
