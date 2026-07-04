@@ -1,0 +1,18 @@
+# 非秘匿設定。制限値には src/llm_fund/validator/rules.py の絶対上限が別途かかる
+llm:
+  model: claude-sonnet-5
+  # 口座残高の実額を LLM に送らず、比率ベースで判断させる
+  ratio_only: true
+
+limits:
+  max_position_pct: 15.0      # 1銘柄の組入上限（%）
+  max_turnover_pct: 30.0      # 1回の指示での回転率上限（%）
+  max_instructions_per_day: 5
+  require_stop_loss: true     # SL（損切り）未指定の指示は拒否
+
+benchmark:
+  index_symbol: "1306.T"      # TOPIX連動ETF（積立ベンチマーク）
+  momentum_lookback_days: 120 # 単純モメンタムルールのルックバック
+
+report:
+  output_dir: reports
