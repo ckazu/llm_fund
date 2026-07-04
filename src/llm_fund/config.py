@@ -13,6 +13,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from llm_fund.domain.models import MAX_DAILY_TICKET_SEQUENCE
 from llm_fund.validator.rules import (
     ABSOLUTE_MAX_POSITION_PCT,
     ABSOLUTE_MAX_TURNOVER_PCT,
@@ -51,6 +52,15 @@ class LimitsSettings(BaseModel):
             raise ConfigError(
                 f"limits.max_turnover_pct={self.max_turnover_pct} exceeds absolute "
                 f"cap {ABSOLUTE_MAX_TURNOVER_PCT}"
+            )
+        if self.max_instructions_per_day < 1:
+            raise ConfigError(
+                f"limits.max_instructions_per_day={self.max_instructions_per_day} must be >= 1"
+            )
+        if self.max_instructions_per_day > MAX_DAILY_TICKET_SEQUENCE:
+            raise ConfigError(
+                f"limits.max_instructions_per_day={self.max_instructions_per_day} exceeds the "
+                f"daily ticket capacity {MAX_DAILY_TICKET_SEQUENCE}（ticket_no は2桁連番）"
             )
         return self
 

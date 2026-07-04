@@ -92,6 +92,39 @@ class TestComputeAtrPct:
 
         assert compute_atr_pct(candles, 14) is None
 
+    def test_split_does_not_spike_atr(self) -> None:
+        # Model a 2-for-1 split within the ATR window. The economically continuous
+        # (adjusted) series is identical to the no-split fixture, but the RAW quotes
+        # jump: pre-split raw prices are double the post-split ones (back-adjustment
+        # divides them by 2). A raw-close ATR would show a huge false spike at the
+        # split; the adj_close-based computation must reproduce the no-split value.
+        base = _linear_candles(80, spike_last_volume=False)
+        split_index = len(base) - 5
+        split_candles = []
+        for i, c in enumerate(base):
+            if i < split_index:
+                # Pre-split raw = adjusted * 2; adj_close stays on the continuous line.
+                split_candles.append(
+                    c.model_copy(
+                        update={
+                            "open": c.open * 2,
+                            "high": c.high * 2,
+                            "low": c.low * 2,
+                            "close": c.close * 2,
+                            "adj_close": c.close,
+                        }
+                    )
+                )
+            else:
+                # Post-split raw == adjusted (factor 1).
+                split_candles.append(c)
+
+        atr_pct = compute_atr_pct(split_candles, 14)
+        assert atr_pct is not None
+        # Identical to the continuous no-split case: TR is a constant 2, latest
+        # adj_close is 179. A raw-close computation would instead spike at the split.
+        assert atr_pct == pytest.approx(2 / 179 * 100)
+
 
 class TestComputeVolumeRatio:
     def test_matches_hand_calculation(self) -> None:

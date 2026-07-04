@@ -16,8 +16,10 @@ turnover and data freshness — live in `gate.py` instead.
 Long-only cash semantics (requirements.md 現物ロングオンリー): only BUY orders
 introduce new capital risk, so the capital-risk rules (StopLossRequired,
 MaxLossPerTrade, CashSufficiency, MaxPositionPct, MaxExposure) pass exit orders
-(SELL/CLOSE) through. Structural rules (UniverseMember, LotSize, TickSize,
-PriceBandSanity) apply to every order regardless of side.
+(SELL/CLOSE) through. Exit orders instead face ExitWithinHolding, which forbids
+selling more units than are held (no naked short in a spot long-only book).
+Structural rules (UniverseMember, LotSize, TickSize, PriceBandSanity) apply to
+every order regardless of side.
 """
 
 from collections.abc import Callable
@@ -131,6 +133,7 @@ class RiskLimits:
     max_turnover_pct: float
     min_rationale_length: int
     require_stop_loss: bool
+    max_instructions_per_day: int
 
     @classmethod
     def from_settings(cls, settings: "LimitsSettings") -> "RiskLimits":
@@ -141,6 +144,7 @@ class RiskLimits:
             max_turnover_pct=min(settings.max_turnover_pct, ABSOLUTE_MAX_TURNOVER_PCT),
             min_rationale_length=MIN_RATIONALE_LENGTH,
             require_stop_loss=settings.require_stop_loss,
+            max_instructions_per_day=settings.max_instructions_per_day,
         )
 
 
@@ -261,6 +265,26 @@ def rule_max_exposure(order: OrderPlan, ctx: ValidationContext) -> str | None:
     return None
 
 
+def rule_exit_within_holding(order: OrderPlan, ctx: ValidationContext) -> str | None:
+    """SELL/CLOSE が保有株数を超える指示を拒否する。
+
+    現物ロングオンリー（requirements.md）では空売りを持たないため、保有株数を超える
+    決済は事実上の裸ショートになる。BUY は新規建てなので対象外（保有制約は
+    MaxPositionPct が見る）。
+    """
+    if order.action is Action.BUY:
+        return None
+    inst = _instrument(order, ctx)
+    if inst is None:  # 未登録銘柄は UniverseMember が拒否する
+        return None
+    if order.units > inst.current_units:
+        return (
+            f"決済株数 {order.units} が保有株数 {inst.current_units} を超過"
+            "（現物ロングオンリーのため空売りは不可）"
+        )
+    return None
+
+
 def rule_universe_member(order: OrderPlan, ctx: ValidationContext) -> str | None:
     """ユニバース外（未登録 or in_universe=False）の銘柄を拒否する。"""
     inst = _instrument(order, ctx)
@@ -329,6 +353,7 @@ HARD_RULES: tuple[tuple[str, Rule], ...] = (
     ("CashSufficiency", rule_cash_sufficiency),
     ("MaxPositionPct", rule_max_position_pct),
     ("MaxExposure", rule_max_exposure),
+    ("ExitWithinHolding", rule_exit_within_holding),
     ("UniverseMember", rule_universe_member),
     ("LotSize", rule_lot_size),
     ("TickSize", rule_tick_size),

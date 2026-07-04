@@ -96,6 +96,32 @@ class TestLoadSettings:
 
         assert settings.limits.max_position_pct == 25.0
 
+    def test_max_instructions_per_day_over_ticket_capacity_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        # ticket_no は2桁連番なので1日100件はフォーマット容量を超える。
+        bad = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_instructions_per_day": 100},
+        }
+        _write_yaml(config_dir / "default.yaml", bad)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_max_instructions_per_day_at_capacity_accepted(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        ok = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_instructions_per_day": 99},
+        }
+        _write_yaml(config_dir / "default.yaml", ok)
+
+        settings = load_settings(config_dir=config_dir, env_file=missing_env)
+
+        assert settings.limits.max_instructions_per_day == 99
+
     def test_missing_required_section_raises_config_error(
         self, config_dir: Path, missing_env: Path
     ) -> None:

@@ -23,6 +23,7 @@ from llm_fund.validator.rules import (
     RiskLimits,
     ValidationContext,
     rule_cash_sufficiency,
+    rule_exit_within_holding,
     rule_lot_size,
     rule_max_exposure,
     rule_max_loss_per_trade,
@@ -49,6 +50,7 @@ def _limits(
     max_loss_per_trade_pct: float = 3.0,
     min_rationale_length: int = MIN_RATIONALE_LENGTH,
     require_stop_loss: bool = True,
+    max_instructions_per_day: int = 5,
 ) -> RiskLimits:
     return RiskLimits(
         max_loss_per_trade_pct=max_loss_per_trade_pct,
@@ -57,6 +59,7 @@ def _limits(
         max_turnover_pct=max_turnover_pct,
         min_rationale_length=min_rationale_length,
         require_stop_loss=require_stop_loss,
+        max_instructions_per_day=max_instructions_per_day,
     )
 
 
@@ -141,6 +144,7 @@ class TestRiskLimitsFromSettings:
         assert limits.max_position_pct == 15.0
         assert limits.max_turnover_pct == 30.0
         assert limits.require_stop_loss is True
+        assert limits.max_instructions_per_day == 5
         # No config field exists for these — they fall back to the absolute cap.
         assert limits.max_loss_per_trade_pct == ABSOLUTE_MAX_LOSS_PER_TRADE_PCT
         assert limits.max_exposure_pct == ABSOLUTE_MAX_EXPOSURE_PCT
@@ -256,6 +260,37 @@ class TestMaxExposure:
     def test_exit_order_does_not_add_exposure(self) -> None:
         order = _order(action=Action.SELL, entry_price=1000.0, units=100)
         assert rule_max_exposure(order, _ctx(current_exposure=950_000.0)) is None
+
+
+class TestExitWithinHolding:
+    def test_sell_within_holding_passes(self) -> None:
+        instruments = {"7203.T": _instrument(current_units=200)}
+        order = _order(action=Action.SELL, units=100)
+        assert rule_exit_within_holding(order, _ctx(instruments=instruments)) is None
+
+    def test_sell_exactly_all_holding_passes(self) -> None:
+        instruments = {"7203.T": _instrument(current_units=100)}
+        order = _order(action=Action.CLOSE, units=100)
+        assert rule_exit_within_holding(order, _ctx(instruments=instruments)) is None
+
+    def test_sell_over_holding_rejected(self) -> None:
+        instruments = {"7203.T": _instrument(current_units=100)}
+        order = _order(action=Action.SELL, units=10000)
+        assert rule_exit_within_holding(order, _ctx(instruments=instruments)) is not None
+
+    def test_sell_with_no_holding_rejected(self) -> None:
+        instruments = {"7203.T": _instrument(current_units=0)}
+        order = _order(action=Action.CLOSE, units=100)
+        assert rule_exit_within_holding(order, _ctx(instruments=instruments)) is not None
+
+    def test_buy_is_not_subject_to_holding_check(self) -> None:
+        instruments = {"7203.T": _instrument(current_units=0)}
+        order = _order(action=Action.BUY, units=100)
+        assert rule_exit_within_holding(order, _ctx(instruments=instruments)) is None
+
+    def test_missing_instrument_defers_to_universe_rule(self) -> None:
+        order = _order(symbol="9999.T", action=Action.SELL, units=100)
+        assert rule_exit_within_holding(order, _ctx()) is None
 
 
 class TestUniverseMember:

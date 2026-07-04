@@ -18,6 +18,8 @@ from llm_fund.domain.enums import (
 
 # 人間向け識別子 ticket_no のフォーマット: "YYYYMMDD-NN"（同日の連番2桁）
 TICKET_NO_PATTERN = r"^\d{8}-\d{2}$"
+# 連番は2桁なので1日あたり 01〜99 の 99 件が上限。日次指示数の設定はこれを超えられない。
+MAX_DAILY_TICKET_SEQUENCE = 99
 
 
 class _Frozen(BaseModel):

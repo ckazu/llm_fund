@@ -49,6 +49,7 @@ def _ctx(
     current_exposure: float = 0.0,
     instruments: dict[str, InstrumentContext] | None = None,
     max_turnover_pct: float = 30.0,
+    max_instructions_per_day: int = 5,
     data_fresh: bool = True,
 ) -> ValidationContext:
     if instruments is None:
@@ -67,6 +68,7 @@ def _ctx(
         max_turnover_pct=max_turnover_pct,
         min_rationale_length=20,
         require_stop_loss=True,
+        max_instructions_per_day=max_instructions_per_day,
     )
     return ValidationContext(
         nav=nav,
@@ -196,6 +198,84 @@ class TestApplyGateTurnover:
         decision = apply_gate([order], _ctx(), AS_OF)
         assert decision.validated == []
         assert len(decision.rejections) == 1
+
+
+class TestApplyGateCumulativeCaps:
+    """Absolute caps must bind across a batch, not just per isolated order."""
+
+    def test_two_buys_same_symbol_breaching_position_cap_rejected(self) -> None:
+        # NAV 1M, position cap 25% = 250,000. Two BUYs of 6758.T each 200,000 (=20%)
+        # pass in isolation but together are 400,000 (=40%) — the second must be rejected.
+        orders = [_order(symbol="6758.T"), _order(symbol="6758.T")]
+        decision = apply_gate(orders, _ctx(max_turnover_pct=100.0), AS_OF)
+        assert len(decision.validated) == 1
+        assert len(decision.rejections) == 1
+        assert any("MaxPositionPct" in r for r in decision.rejections[0].reasons)
+
+    def test_two_buys_breaching_cumulative_cash_rejected(self) -> None:
+        # cash 300,000; two 200,000 BUYs — the second exceeds the remaining 100,000.
+        orders = [_order(symbol="7203.T"), _order(symbol="6758.T")]
+        decision = apply_gate(orders, _ctx(cash=300_000.0, max_turnover_pct=100.0), AS_OF)
+        assert len(decision.validated) == 1
+        assert any("CashSufficiency" in r for r in decision.rejections[0].reasons)
+
+    def test_two_buys_breaching_cumulative_exposure_rejected(self) -> None:
+        # exposure cap 100% NAV = 1,000,000; start at 700,000. First BUY -> 900,000 (ok),
+        # second BUY -> 1,100,000 must be rejected.
+        ctx = _ctx(current_exposure=700_000.0, max_turnover_pct=100.0)
+        orders = [_order(symbol="7203.T"), _order(symbol="6758.T")]
+        decision = apply_gate(orders, ctx, AS_OF)
+        assert len(decision.validated) == 1
+        assert any("MaxExposure" in r for r in decision.rejections[0].reasons)
+
+
+def _held_instruments(current_units: int) -> dict[str, InstrumentContext]:
+    return {
+        "7203.T": InstrumentContext(
+            symbol="7203.T",
+            in_universe=True,
+            lot_size=100,
+            prev_close=2000.0,
+            current_units=current_units,
+        )
+    }
+
+
+class TestApplyGateExitWithinHolding:
+    def test_oversized_exit_is_rejected(self) -> None:
+        order = _order(action=Action.SELL, units=10000)
+        decision = apply_gate([order], _ctx(instruments=_held_instruments(100)), AS_OF)
+        assert decision.validated == []
+        assert any("ExitWithinHolding" in r for r in decision.rejections[0].reasons)
+
+    def test_exit_within_holding_is_validated(self) -> None:
+        order = _order(action=Action.SELL, units=100)
+        decision = apply_gate([order], _ctx(instruments=_held_instruments(200)), AS_OF)
+        assert len(decision.validated) == 1
+
+    def test_two_exits_cannot_exceed_holding(self) -> None:
+        orders = [_order(action=Action.SELL, units=100), _order(action=Action.SELL, units=100)]
+        ctx = _ctx(instruments=_held_instruments(100), max_turnover_pct=100.0)
+        decision = apply_gate(orders, ctx, AS_OF)
+        assert len(decision.validated) == 1
+        assert any("ExitWithinHolding" in r for r in decision.rejections[0].reasons)
+
+
+class TestApplyGateMaxInstructions:
+    def test_exceeding_daily_cap_rejects_further_orders(self) -> None:
+        orders = [_order(symbol="7203.T"), _order(symbol="6758.T"), _order(symbol="7203.T")]
+        ctx = _ctx(max_instructions_per_day=2, max_turnover_pct=100.0)
+        decision = apply_gate(orders, ctx, AS_OF)
+        assert len(decision.validated) == 2
+        assert any("MaxInstructionsPerDay" in r for r in decision.rejections[0].reasons)
+
+    def test_cap_counts_from_ticket_seq_start(self) -> None:
+        # Two instructions already exist today (seq start 3); cap 2 rejects the next.
+        decision = apply_gate(
+            [_order()], _ctx(max_instructions_per_day=2), AS_OF, ticket_seq_start=3
+        )
+        assert decision.validated == []
+        assert any("MaxInstructionsPerDay" in r for r in decision.rejections[0].reasons)
 
 
 class TestApplyGateDataFreshness:

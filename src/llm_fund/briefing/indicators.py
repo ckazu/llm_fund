@@ -60,16 +60,22 @@ def compute_atr_pct(candles: list[Candle], window_days: int = ATR_WINDOW_DAYS) -
     window = candles[-window_days:]
     true_ranges = []
     for i, candle in enumerate(window):
-        prev_close = candles[len(candles) - window_days + i - 1].close
+        # high/low を調整係数 (adj_close/close) でスケールし、株式分割・配当による
+        # 価格の不連続をならす。Candle は adj_high/adj_low を持たないため close 比で
+        # 近似する（他指標が adj_close を使うのと整合させ、分割ギャップが値幅を汚さない）。
+        factor = candle.adj_close / candle.close
+        adj_high = candle.high * factor
+        adj_low = candle.low * factor
+        prev_adj_close = candles[len(candles) - window_days + i - 1].adj_close
         true_ranges.append(
             max(
-                candle.high - candle.low,
-                abs(candle.high - prev_close),
-                abs(candle.low - prev_close),
+                adj_high - adj_low,
+                abs(adj_high - prev_adj_close),
+                abs(adj_low - prev_adj_close),
             )
         )
     atr = mean(true_ranges)
-    return atr / candles[-1].close * 100.0
+    return atr / candles[-1].adj_close * 100.0
 
 
 def compute_volume_ratio(
