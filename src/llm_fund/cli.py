@@ -1,7 +1,7 @@
 """CLI entry point for llm_fund."""
 
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime
 
 import anthropic
 import typer
@@ -11,6 +11,7 @@ from llm_fund.config import AppSettings, ConfigError, load_settings
 from llm_fund.data.loader import DataFreshnessError, PriceLoader
 from llm_fund.data.prices import YFinanceSource
 from llm_fund.delivery.report import write_report
+from llm_fund.domain.enums import ExecutionStatus, InstructionStatus
 from llm_fund.domain.models import Candle, JudgmentResult
 from llm_fund.judgment import prompts
 from llm_fund.judgment.client import (
@@ -23,12 +24,14 @@ from llm_fund.store.repos import (
     AuditEventRepo,
     BriefingRepo,
     CandleRepo,
+    ExecutionRepo,
     InstructionRepo,
     InstrumentRepo,
     LlmCallRepo,
     PortfolioStateRepo,
     UniverseRecord,
     UniverseRepo,
+    price_deviation_pct,
 )
 from llm_fund.validator.gate import GateDecision, apply_gate, persist_gate_result
 from llm_fund.validator.rules import (
@@ -40,6 +43,8 @@ from llm_fund.validator.rules import (
 DEFAULT_FETCH_LOOKBACK_DAYS = 365
 REPORT_KIND = "report"
 DAILY_KIND = "daily"
+# ブローカーへの注文形態。本システムはサーバーサイド IFO 注文のみを扱う（technical-spec.md 2章）。
+ORDER_TYPE_IFO = "IFO"
 
 app = typer.Typer(help="LLM-powered investment fund manager CLI")
 
@@ -469,24 +474,71 @@ def monthly(
 @app.command()
 def record(
     ticket_no: str = typer.Argument(..., help="Instruction ticket ID (e.g., 20260704-01)"),
-    executed_at: str = typer.Option(
-        ..., help="Execution timestamp (ISO 8601, e.g., 2026-07-04T10:30:00+09:00)"
+    price: float = typer.Option(..., "--price", help="Actual execution price"),
+    units: int | None = typer.Option(
+        None, "--units", help="Actual executed units (default: the instructed units)"
     ),
-    actual_price: float = typer.Option(..., help="Actual execution price"),
-    actual_units: int = typer.Option(..., help="Actual executed units"),
-    status: str = typer.Option(
-        "filled", help="Execution status: filled, partial, skipped"
+    skipped: str | None = typer.Option(
+        None, "--skipped", help="Reason the order was not executed (marks status=skipped)"
     ),
-    skip_reason: str | None = typer.Option(None, help="Reason if skipped"),
+    commission: float = typer.Option(0.0, "--commission", help="Actual commission paid"),
 ) -> None:
-    """Record manual execution result for a trading instruction.
+    """Record the human execution result for one instruction (FR-4).
 
-    Updates the instruction status and calculates deviation from expected execution.
+    Resolves `ticket_no` to the internal instruction (PK never exposed), writes an
+    `executions` row, and moves the instruction to filled/partial/skipped. Aborts with
+    exit code 1 if `ticket_no` is unknown or the units/price combination is invalid.
     """
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        typer.echo(f"[record] config error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    conn = init_db(settings.db_path)
+    instruction_repo = InstructionRepo(conn)
+    instruction = instruction_repo.get_by_ticket_no(ticket_no)
+    if instruction is None:
+        typer.echo(f"[record] unknown ticket_no: {ticket_no}", err=True)
+        raise typer.Exit(code=1)
+
+    if skipped is not None:
+        actual_units = 0
+        exec_status = ExecutionStatus.SKIPPED
+        deviation_note = None
+    else:
+        actual_units = units if units is not None else instruction.units
+        if actual_units <= 0:
+            typer.echo(
+                "[record] --units must be > 0 unless --skipped is given", err=True
+            )
+            raise typer.Exit(code=1)
+        exec_status = (
+            ExecutionStatus.FILLED
+            if actual_units >= instruction.units
+            else ExecutionStatus.PARTIAL
+        )
+        deviation_pct = price_deviation_pct(price, instruction.entry_price)
+        deviation_note = f"価格乖離: {deviation_pct:+.2f}%"
+
+    ExecutionRepo(conn).add(
+        instruction_id=instruction.id,
+        executed_at=datetime.now(UTC),
+        side=instruction.action,
+        order_type=ORDER_TYPE_IFO,
+        actual_price=price,
+        actual_units=actual_units,
+        commission=commission,
+        status=exec_status.value,
+        skip_reason=skipped,
+        deviation_note=deviation_note,
+    )
+    instruction_repo.update_status(instruction.id, exec_status.value)
+
     typer.echo(
-        f"[record] ticket_no={ticket_no}, executed_at={executed_at}, "
-        f"actual_price={actual_price}, actual_units={actual_units}, "
-        f"status={status} (not yet implemented)"
+        f"[record] ticket_no={ticket_no} status={exec_status.value} "
+        f"price={price} units={actual_units}"
+        + (f" skip_reason={skipped}" if skipped else f" {deviation_note}")
     )
 
 
@@ -566,11 +618,48 @@ def fetch(
 
 @app.command()
 def status() -> None:
-    """Display current system status (DB, cache freshness, fund NAV, positions).
+    """Display NAV, unrecorded instructions, and instruction/execution deviation (FR-4).
 
     Quick health check before running daily/weekly/monthly cycles.
     """
-    typer.echo("[status] (not yet implemented)")
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        typer.echo(f"[status] config error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    conn = init_db(settings.db_path)
+    lines = ["[status]"]
+
+    portfolio = PortfolioStateRepo(conn).latest()
+    if portfolio is not None:
+        lines.append(
+            f"- NAV: {portfolio.nav:,.0f} (date={portfolio.state_date.isoformat()}, "
+            f"cash={portfolio.cash:,.0f})"
+        )
+    else:
+        lines.append("- NAV: 未初期化")
+
+    instruction_repo = InstructionRepo(conn)
+    pending = instruction_repo.list_by_status(InstructionStatus.PENDING.value)
+    lines.append(f"- 未記録の指示: {len(pending)}件")
+    for inst in pending:
+        lines.append(f"  - {inst.ticket_no} {inst.action} {inst.units}株")
+
+    deviations = ExecutionRepo(conn).list_deviations()
+    if deviations:
+        lines.append("- 指示と執行の乖離:")
+        for dev in deviations:
+            if dev.deviation_pct is None:
+                lines.append(f"  - {dev.ticket_no}: 未執行（{dev.status}）")
+            else:
+                lines.append(f"  - {dev.ticket_no}: 価格乖離 {dev.deviation_pct:+.2f}%")
+
+    unexecuted_rate = ExecutionRepo(conn).unexecuted_rate()
+    if unexecuted_rate is not None:
+        lines.append(f"- 未執行率: {unexecuted_rate * 100:.1f}%")
+
+    typer.echo("\n".join(lines))
 
 
 if __name__ == "__main__":

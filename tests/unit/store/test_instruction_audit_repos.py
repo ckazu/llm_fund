@@ -86,6 +86,28 @@ class TestInstructionRepo:
         _add_instruction(conn, "20260704-01", briefing_id, instrument_id)
         assert InstructionRepo(conn).next_sequence(date(2026, 7, 4)) == 2
 
+    def test_update_status_changes_status(self, conn: sqlite3.Connection) -> None:
+        briefing_id, instrument_id = _seed_fk(conn)
+        row_id = _add_instruction(conn, "20260704-01", briefing_id, instrument_id)
+        repo = InstructionRepo(conn)
+
+        repo.update_status(row_id, InstructionStatus.FILLED.value)
+
+        record = repo.get_by_ticket_no("20260704-01")
+        assert record is not None
+        assert record.status == InstructionStatus.FILLED.value
+
+    def test_list_by_status_filters(self, conn: sqlite3.Connection) -> None:
+        briefing_id, instrument_id = _seed_fk(conn)
+        id1 = _add_instruction(conn, "20260704-01", briefing_id, instrument_id)
+        _add_instruction(conn, "20260704-02", briefing_id, instrument_id)
+        repo = InstructionRepo(conn)
+        repo.update_status(id1, InstructionStatus.FILLED.value)
+
+        pending = repo.list_by_status(InstructionStatus.PENDING.value)
+
+        assert [r.ticket_no for r in pending] == ["20260704-02"]
+
 
 class TestAuditEventRepo:
     def test_add_and_list_all(self, conn: sqlite3.Connection) -> None:

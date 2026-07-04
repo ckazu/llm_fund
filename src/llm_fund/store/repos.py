@@ -1,7 +1,8 @@
 """Repository layer over the SQLite store.
 
 S2 added instruments/universes/candles/portfolio_state. S4 adds `BriefingRepo`
-(briefings table) for the report line. Instructions/executions/tracking/audit
+(briefings table) for the report line. S5 adds `InstructionRepo`/`AuditEventRepo`.
+S7 adds `ExecutionRepo` (executions table; FR-4 執行記録・乖離). Tracking
 repositories are still added in later steps as their modules are built.
 
 Records returned here are plain frozen dataclasses rather than the pydantic
@@ -14,6 +15,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
+from llm_fund.domain.enums import ExecutionStatus
 from llm_fund.domain.models import Candle
 
 # 東証の一般的な売買単位（100株）。instruments.lot_size の既定値。
@@ -406,6 +408,19 @@ class InstructionRepo:
         """Next 1-based ticket_no sequence for `as_of` (idempotent re-runs stay monotonic)."""
         return self.count_for_date(as_of) + 1
 
+    def update_status(self, instruction_id: int, status: str) -> None:
+        """Move an instruction to `status` (S7: filled/partial/skipped after `fund record`)."""
+        self._conn.execute(
+            "UPDATE instructions SET status = ? WHERE id = ?", (status, instruction_id)
+        )
+        self._conn.commit()
+
+    def list_by_status(self, status: str) -> list[InstructionRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM instructions WHERE status = ? ORDER BY ticket_no", (status,)
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
     @staticmethod
     def _to_record(row: sqlite3.Row) -> InstructionRecord:
         return InstructionRecord(
@@ -559,4 +574,138 @@ class AuditEventRepo:
             ts=datetime.fromisoformat(row["ts"]),
             kind=row["kind"],
             detail_json=row["detail_json"],
+        )
+
+
+def price_deviation_pct(actual_price: float, expected_price: float) -> float:
+    """指示価格 (expected) からの実行価格 (actual) の乖離率（符号付き%）。"""
+    return (actual_price - expected_price) / expected_price * 100
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecord:
+    id: int
+    instruction_id: int
+    executed_at: datetime
+    side: str
+    order_type: str
+    actual_price: float
+    actual_units: int
+    commission: float
+    status: str
+    skip_reason: str | None
+    deviation_note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionDeviation:
+    """1件の執行の指示との乖離（`fund status` の可視化用）。skipped は乖離%を持たない。"""
+
+    ticket_no: str
+    status: str
+    entry_price: float
+    actual_price: float
+    deviation_pct: float | None
+
+
+class ExecutionRepo:
+    """Write/read for `executions`（FR-4: 人間の執行結果と指示の乖離）。"""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(
+        self,
+        *,
+        instruction_id: int,
+        executed_at: datetime,
+        side: str,
+        order_type: str,
+        actual_price: float,
+        actual_units: int,
+        commission: float,
+        status: str,
+        skip_reason: str | None = None,
+        deviation_note: str | None = None,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO executions "
+            "(instruction_id, executed_at, side, order_type, actual_price, actual_units, "
+            "commission, status, skip_reason, deviation_note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                instruction_id,
+                executed_at.isoformat(),
+                side,
+                order_type,
+                actual_price,
+                actual_units,
+                commission,
+                status,
+                skip_reason,
+                deviation_note,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_instruction_id(self, instruction_id: int) -> ExecutionRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM executions WHERE instruction_id = ? ORDER BY id DESC LIMIT 1",
+            (instruction_id,),
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def list_deviations(self) -> list[ExecutionDeviation]:
+        """全執行を指示と結合し、価格乖離%を算出する（`status=skipped` は None）。"""
+        rows = self._conn.execute(
+            "SELECT e.status AS status, e.actual_price AS actual_price, "
+            "i.entry_price AS entry_price, i.ticket_no AS ticket_no "
+            "FROM executions e JOIN instructions i ON i.id = e.instruction_id "
+            "ORDER BY e.id"
+        ).fetchall()
+        result: list[ExecutionDeviation] = []
+        for row in rows:
+            is_skipped = row["status"] == ExecutionStatus.SKIPPED.value
+            deviation_pct = (
+                None
+                if is_skipped
+                else price_deviation_pct(row["actual_price"], row["entry_price"])
+            )
+            result.append(
+                ExecutionDeviation(
+                    ticket_no=row["ticket_no"],
+                    status=row["status"],
+                    entry_price=row["entry_price"],
+                    actual_price=row["actual_price"],
+                    deviation_pct=deviation_pct,
+                )
+            )
+        return result
+
+    def unexecuted_rate(self) -> float | None:
+        """`skipped` 件数 / 全執行記録件数。記録が1件も無ければ None。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS skipped FROM executions",
+            (ExecutionStatus.SKIPPED.value,),
+        ).fetchone()
+        if row["n"] == 0:
+            return None
+        return int(row["skipped"]) / int(row["n"])
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> ExecutionRecord:
+        return ExecutionRecord(
+            id=row["id"],
+            instruction_id=row["instruction_id"],
+            executed_at=datetime.fromisoformat(row["executed_at"]),
+            side=row["side"],
+            order_type=row["order_type"],
+            actual_price=row["actual_price"],
+            actual_units=row["actual_units"],
+            commission=row["commission"],
+            status=row["status"],
+            skip_reason=row["skip_reason"],
+            deviation_note=row["deviation_note"],
         )
