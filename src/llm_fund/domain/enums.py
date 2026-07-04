@@ -49,3 +49,16 @@ class ProposalStatus(StrEnum):
     DRAFT = "draft"
     ACTIVE = "active"
     SUPERSEDED = "superseded"
+
+
+class PendingOrderStatus(StrEnum):
+    """Virtual IFO order lifecycle tracked in `pending_orders`.
+
+    Independent of `InstructionStatus` (which tracks the *human* execution): this
+    is the conservative virtual-fill engine's own view of the limit order — still
+    waiting (pending), filled, or expired unfilled.
+    """
+
+    PENDING = "pending"
+    FILLED = "filled"
+    EXPIRED = "expired"

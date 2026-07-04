@@ -30,6 +30,16 @@ DEFAULT_DB_PATH = "llm_fund.db"
 # 営業日カレンダーを持たないための近似既定値。data/loader.py の既定と合わせる。
 DEFAULT_MAX_STALENESS_DAYS = 4
 
+# --- tracking（仮想執行・ベンチマーク）既定値（technical-spec.md 7章）------------
+# 全戦略（fund / 対照群）に同一適用する開始資本・コスト条件。比較の公平性のため
+# ベンチマーク側にも仮想執行と同じ手数料・スリッページを課す。
+DEFAULT_STARTING_CAPITAL = 1_000_000.0
+DEFAULT_COMMISSION_RATE = 0.0005  # 約定代金の0.05%
+DEFAULT_MIN_COMMISSION = 0.0
+DEFAULT_SLIPPAGE_PCT = 0.001  # 0.1%
+# ランダム対照群のシード（固定して再現可能にする。requirements FR-5）。
+DEFAULT_RANDOM_SEED = 42
+
 
 class ConfigError(Exception):
     """Raised when configuration is missing/invalid or exceeds absolute limits."""
@@ -91,6 +101,28 @@ class BenchmarkSettings(BaseModel):
     momentum_lookback_days: int
 
 
+class TrackingSettings(BaseModel):
+    """仮想執行エンジン・対照群ベンチマーク共通のコスト/資金条件（technical-spec.md 7章）。"""
+
+    starting_capital: float = DEFAULT_STARTING_CAPITAL
+    commission_rate: float = DEFAULT_COMMISSION_RATE
+    min_commission: float = DEFAULT_MIN_COMMISSION
+    slippage_pct: float = DEFAULT_SLIPPAGE_PCT
+    random_seed: int = DEFAULT_RANDOM_SEED
+
+    @model_validator(mode="after")
+    def _check_non_negative(self) -> "TrackingSettings":
+        if self.starting_capital <= 0:
+            raise ConfigError(
+                f"tracking.starting_capital={self.starting_capital} must be > 0"
+            )
+        for name in ("commission_rate", "min_commission", "slippage_pct"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ConfigError(f"tracking.{name}={value} must be >= 0")
+        return self
+
+
 class ReportSettings(BaseModel):
     output_dir: str
 
@@ -131,6 +163,7 @@ class AppSettings(BaseSettings):
     report: ReportSettings
     data: DataSettings = Field(default_factory=DataSettings)
     judgment: JudgmentSettings = Field(default_factory=JudgmentSettings)
+    tracking: TrackingSettings = Field(default_factory=TrackingSettings)
     universes: dict[str, UniverseConfig]
 
 

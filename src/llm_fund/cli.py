@@ -33,6 +33,8 @@ from llm_fund.store.repos import (
     UniverseRepo,
     price_deviation_pct,
 )
+from llm_fund.tracking import benchmark as benchmark_mod
+from llm_fund.tracking.virtual_fill import CostModel, run_virtual_fills
 from llm_fund.validator.gate import GateDecision, apply_gate, persist_gate_result
 from llm_fund.validator.rules import (
     InstrumentContext,
@@ -436,7 +438,10 @@ def daily(
         briefing_ids=briefing_ids,
         candles_by_code=candles_by_code,
     )
-    full_content = content_md + "\n" + trade_md
+    # 仮想執行でポートフォリオ状態を as_of まで更新し、対照群 NAV を日次更新する（FR-5）。
+    summary = _run_tracking(settings, conn, as_of)
+    benchmark_md = _render_benchmark_section(summary)
+    full_content = content_md + "\n" + trade_md + "\n" + benchmark_md
     out_path = write_report(settings.report.output_dir, as_of, DAILY_KIND, full_content)
     typer.echo(
         f"[daily] date={as_of.isoformat()}, no_llm={no_llm}, format={format_} -> {out_path}"
@@ -542,6 +547,73 @@ def record(
     )
 
 
+def _cost_model(settings: AppSettings) -> CostModel:
+    """Build the shared `CostModel` from `tracking` config (same for fund and benchmarks)."""
+    return CostModel(
+        commission_rate=settings.tracking.commission_rate,
+        min_commission=settings.tracking.min_commission,
+        slippage_pct=settings.tracking.slippage_pct,
+    )
+
+
+def _trade_universe_symbols(settings: AppSettings) -> list[str]:
+    """All instrument symbols across trade-enabled universes (benchmark opportunity set)."""
+    symbols: list[str] = []
+    for conf in settings.universes.values():
+        if conf.trade:
+            symbols.extend(inst.symbol for inst in conf.instruments)
+    return symbols
+
+
+def _run_tracking(
+    settings: AppSettings, conn: sqlite3.Connection, as_of: date
+) -> benchmark_mod.BenchmarkSummary:
+    """Run the virtual-fill engine, then update the control benchmarks (daily / on demand).
+
+    Virtual fill runs first so `portfolio_state` (the fund NAV series) is current before the
+    benchmark reads it. Both are deterministic full recomputations, so re-running is idempotent.
+    """
+    costs = _cost_model(settings)
+    run_virtual_fills(
+        conn, as_of, costs=costs, starting_capital=settings.tracking.starting_capital
+    )
+    return benchmark_mod.run_benchmark(
+        conn,
+        as_of,
+        universe_symbols=_trade_universe_symbols(settings),
+        index_symbol=settings.benchmark.index_symbol,
+        momentum_lookback_days=settings.benchmark.momentum_lookback_days,
+        random_seed=settings.tracking.random_seed,
+        costs=costs,
+        starting_capital=settings.tracking.starting_capital,
+    )
+
+
+def _render_benchmark_section(summary: benchmark_mod.BenchmarkSummary) -> str:
+    """Render the LLM-vs-control NAV comparison as a Markdown section."""
+    lines = ["## ベンチマーク比較（対照群）\n"]
+    if not summary.latest_nav:
+        return lines[0] + "\n比較可能なデータがありません\n"
+    for code in (
+        benchmark_mod.STRATEGY_FUND,
+        benchmark_mod.STRATEGY_INDEX,
+        benchmark_mod.STRATEGY_EQUAL_WEIGHT,
+        benchmark_mod.STRATEGY_MOMENTUM,
+        benchmark_mod.STRATEGY_RANDOM,
+    ):
+        if code not in summary.latest_nav:
+            continue
+        name = benchmark_mod.STRATEGY_NAMES[code]
+        nav = summary.latest_nav[code]
+        metrics = summary.metrics.get(code, {})
+        max_dd = metrics.get("max_drawdown_pct", 0.0)
+        sharpe = metrics.get("sharpe", 0.0)
+        lines.append(
+            f"- {name}: NAV={nav:,.0f} (MaxDD={max_dd:.1f}%, Sharpe={sharpe:.2f})\n"
+        )
+    return "".join(lines)
+
+
 @app.command()
 def benchmark(
     date: str | None = typer.Option(None, help="Target date (YYYY-MM-DD). Defaults to today."),
@@ -553,7 +625,20 @@ def benchmark(
 
     Uses virtual execution to measure pure judgment quality independent of manual execution.
     """
-    typer.echo(f"[benchmark] date={date}, format={format_} (not yet implemented)")
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        typer.echo(f"[benchmark] config error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    as_of = _resolve_as_of(date)
+    conn = init_db(settings.db_path)
+    summary = _run_tracking(settings, conn, as_of)
+    typer.echo(_render_benchmark_section(summary))
+    typer.echo(
+        f"[benchmark] date={as_of.isoformat()} format={format_} "
+        f"strategies={len(summary.latest_nav)}"
+    )
 
 
 @app.command()

@@ -14,5 +14,13 @@ benchmark:
   index_symbol: "1306.T"      # TOPIX連動ETF（積立ベンチマーク）
   momentum_lookback_days: 120 # 単純モメンタムルールのルックバック
 
+# 仮想執行・対照群ベンチマーク共通のコスト/資金条件（全戦略に同一適用）
+tracking:
+  starting_capital: 1000000.0 # 開始資本（全戦略共通）
+  commission_rate: 0.0005     # 手数料率（約定代金の0.05%）
+  min_commission: 0.0         # 最低手数料
+  slippage_pct: 0.001         # スリッページ率（0.1%）
+  random_seed: 42             # ランダム対照群のシード（再現性）
+
 report:
   output_dir: reports

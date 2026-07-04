@@ -248,6 +248,12 @@ class PortfolioStateRepo:
         ).fetchone()
         return self._to_record(row) if row else None
 
+    def list_all(self) -> list[PortfolioStateRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM portfolio_state ORDER BY date"
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
     @staticmethod
     def _to_record(row: sqlite3.Row) -> PortfolioStateRecord:
         return PortfolioStateRecord(
@@ -418,6 +424,12 @@ class InstructionRepo:
     def list_by_status(self, status: str) -> list[InstructionRecord]:
         rows = self._conn.execute(
             "SELECT * FROM instructions WHERE status = ? ORDER BY ticket_no", (status,)
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def list_all(self) -> list[InstructionRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM instructions ORDER BY ticket_no"
         ).fetchall()
         return [self._to_record(row) for row in rows]
 
@@ -708,4 +720,314 @@ class ExecutionRepo:
             status=row["status"],
             skip_reason=row["skip_reason"],
             deviation_note=row["deviation_note"],
+        )
+
+
+# --- S8 tracking（仮想執行・ベンチマーク）---------------------------------------
+# これらのリポジトリが書き込む positions / pending_orders / portfolio_state /
+# virtual_fills / benchmark_navs は tracking レイヤ（virtual_fill.py / benchmark.py）
+# だけが更新する。仮想執行エンジンがポートフォリオ状態の唯一の書き手である
+# （technical-spec.md 7章。真実の源泉）。
+
+
+@dataclass(frozen=True, slots=True)
+class VirtualFillRecord:
+    id: int
+    instruction_id: int
+    fill_date: date | None
+    fill_price: float | None
+    exit_date: date | None
+    exit_price: float | None
+    exit_reason: str | None
+    commission: float
+    slippage: float
+    pnl: float | None
+
+
+class VirtualFillRepo:
+    """Ledger of the conservative virtual-fill engine (`virtual_fills`).
+
+    Keyed logically by `instruction_id` (each instruction has at most one fill
+    record). `upsert` replaces any existing row for the instruction so re-running
+    the engine on a later date can extend a fill with its exit without duplicating.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def upsert(
+        self,
+        *,
+        instruction_id: int,
+        fill_date: date | None,
+        fill_price: float | None,
+        exit_date: date | None,
+        exit_price: float | None,
+        exit_reason: str | None,
+        commission: float,
+        slippage: float,
+        pnl: float | None,
+    ) -> int:
+        self._conn.execute(
+            "DELETE FROM virtual_fills WHERE instruction_id = ?", (instruction_id,)
+        )
+        cur = self._conn.execute(
+            "INSERT INTO virtual_fills "
+            "(instruction_id, fill_date, fill_price, exit_date, exit_price, exit_reason, "
+            "commission, slippage, pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                instruction_id,
+                fill_date.isoformat() if fill_date else None,
+                fill_price,
+                exit_date.isoformat() if exit_date else None,
+                exit_price,
+                exit_reason,
+                commission,
+                slippage,
+                pnl,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_instruction_id(self, instruction_id: int) -> VirtualFillRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM virtual_fills WHERE instruction_id = ?", (instruction_id,)
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def list_all(self) -> list[VirtualFillRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM virtual_fills ORDER BY id"
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> VirtualFillRecord:
+        return VirtualFillRecord(
+            id=row["id"],
+            instruction_id=row["instruction_id"],
+            fill_date=date.fromisoformat(row["fill_date"]) if row["fill_date"] else None,
+            fill_price=row["fill_price"],
+            exit_date=date.fromisoformat(row["exit_date"]) if row["exit_date"] else None,
+            exit_price=row["exit_price"],
+            exit_reason=row["exit_reason"],
+            commission=row["commission"],
+            slippage=row["slippage"],
+            pnl=row["pnl"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PositionRecord:
+    id: int
+    instrument_id: int
+    units: int
+    avg_cost: float
+    opened_at: date
+    closed_at: date | None
+
+
+class PositionRepo:
+    """Open/closed virtual positions (`positions`). Rebuilt from `virtual_fills`.
+
+    The virtual-fill engine owns this table wholesale: each run clears it and
+    rebuilds from the current fills, so the table is always a deterministic
+    projection of the ledger (idempotent re-runs).
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def clear(self) -> None:
+        self._conn.execute("DELETE FROM positions")
+        self._conn.commit()
+
+    def add(
+        self,
+        *,
+        instrument_id: int,
+        units: int,
+        avg_cost: float,
+        opened_at: date,
+        closed_at: date | None,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO positions (instrument_id, units, avg_cost, opened_at, closed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                instrument_id,
+                units,
+                avg_cost,
+                opened_at.isoformat(),
+                closed_at.isoformat() if closed_at else None,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def list_open(self) -> list[PositionRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE closed_at IS NULL ORDER BY id"
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def list_all(self) -> list[PositionRecord]:
+        rows = self._conn.execute("SELECT * FROM positions ORDER BY id").fetchall()
+        return [self._to_record(row) for row in rows]
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> PositionRecord:
+        return PositionRecord(
+            id=row["id"],
+            instrument_id=row["instrument_id"],
+            units=row["units"],
+            avg_cost=row["avg_cost"],
+            opened_at=date.fromisoformat(row["opened_at"]),
+            closed_at=date.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PendingOrderRecord:
+    id: int
+    instruction_id: int
+    expires_at: date
+    status: str
+
+
+class PendingOrderRepo:
+    """Virtual IFO order lifecycle (`pending_orders`). Rebuilt each engine run."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def clear(self) -> None:
+        self._conn.execute("DELETE FROM pending_orders")
+        self._conn.commit()
+
+    def add(self, *, instruction_id: int, expires_at: date, status: str) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO pending_orders (instruction_id, expires_at, status) "
+            "VALUES (?, ?, ?)",
+            (instruction_id, expires_at.isoformat(), status),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def list_all(self) -> list[PendingOrderRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM pending_orders ORDER BY id"
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def list_by_status(self, status: str) -> list[PendingOrderRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM pending_orders WHERE status = ? ORDER BY id", (status,)
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> PendingOrderRecord:
+        return PendingOrderRecord(
+            id=row["id"],
+            instruction_id=row["instruction_id"],
+            expires_at=date.fromisoformat(row["expires_at"]),
+            status=row["status"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyRecord:
+    id: int
+    code: str
+    name: str
+
+
+class StrategyRepo:
+    """Benchmark strategy registry (`strategies`; code is the natural key)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def get_or_create(self, code: str, name: str) -> int:
+        row = self._conn.execute(
+            "SELECT id FROM strategies WHERE code = ?", (code,)
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        cur = self._conn.execute(
+            "INSERT INTO strategies (code, name) VALUES (?, ?)", (code, name)
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_code(self, code: str) -> StrategyRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM strategies WHERE code = ?", (code,)
+        ).fetchone()
+        if row is None:
+            return None
+        return StrategyRecord(id=row["id"], code=row["code"], name=row["name"])
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkNavRecord:
+    id: int
+    strategy_id: int
+    nav_date: date
+    nav: float
+    metrics_json: str | None
+
+
+class BenchmarkNavRepo:
+    """Daily NAV + metrics per strategy (`benchmark_navs`; UNIQUE strategy_id+date)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def upsert(
+        self,
+        *,
+        strategy_id: int,
+        nav_date: date,
+        nav: float,
+        metrics_json: str | None,
+    ) -> int:
+        self._conn.execute(
+            "INSERT INTO benchmark_navs (strategy_id, date, nav, metrics_json) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(strategy_id, date) DO UPDATE SET "
+            "nav=excluded.nav, metrics_json=excluded.metrics_json",
+            (strategy_id, nav_date.isoformat(), nav, metrics_json),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT id FROM benchmark_navs WHERE strategy_id = ? AND date = ?",
+            (strategy_id, nav_date.isoformat()),
+        ).fetchone()
+        return int(row["id"])
+
+    def list_by_strategy(self, strategy_id: int) -> list[BenchmarkNavRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM benchmark_navs WHERE strategy_id = ? ORDER BY date",
+            (strategy_id,),
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def latest(self, strategy_id: int) -> BenchmarkNavRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM benchmark_navs WHERE strategy_id = ? ORDER BY date DESC LIMIT 1",
+            (strategy_id,),
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> BenchmarkNavRecord:
+        return BenchmarkNavRecord(
+            id=row["id"],
+            strategy_id=row["strategy_id"],
+            nav_date=date.fromisoformat(row["date"]),
+            nav=row["nav"],
+            metrics_json=row["metrics_json"],
         )
