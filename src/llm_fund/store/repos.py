@@ -324,3 +324,145 @@ class BriefingRepo:
             data_snapshot_json=row["data_snapshot_json"],
             created_at=datetime.fromisoformat(row["created_at"]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class InstructionRecord:
+    id: int
+    ticket_no: str
+    briefing_id: int
+    instrument_id: int
+    action: str
+    units: int
+    entry_price: float
+    tp_price: float
+    sl_price: float
+    valid_until: date
+    rationale: str
+    validator_result_json: str | None
+    status: str
+
+
+class InstructionRepo:
+    """Write/read for `instructions` (validator output; ticket_no is the natural key)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(
+        self,
+        *,
+        ticket_no: str,
+        briefing_id: int,
+        instrument_id: int,
+        action: str,
+        units: int,
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+        valid_until: date,
+        rationale: str,
+        validator_result_json: str | None,
+        status: str,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO instructions "
+            "(ticket_no, briefing_id, instrument_id, action, units, entry_price, "
+            "tp_price, sl_price, valid_until, rationale, validator_result_json, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticket_no,
+                briefing_id,
+                instrument_id,
+                action,
+                units,
+                entry_price,
+                tp_price,
+                sl_price,
+                valid_until.isoformat(),
+                rationale,
+                validator_result_json,
+                status,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_ticket_no(self, ticket_no: str) -> InstructionRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM instructions WHERE ticket_no = ?", (ticket_no,)
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def count_for_date(self, as_of: date) -> int:
+        """Count instructions whose ticket_no belongs to `as_of` (YYYYMMDD-*)."""
+        prefix = f"{as_of.strftime('%Y%m%d')}-%"
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM instructions WHERE ticket_no LIKE ?", (prefix,)
+        ).fetchone()
+        return int(row["n"])
+
+    def next_sequence(self, as_of: date) -> int:
+        """Next 1-based ticket_no sequence for `as_of` (idempotent re-runs stay monotonic)."""
+        return self.count_for_date(as_of) + 1
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> InstructionRecord:
+        return InstructionRecord(
+            id=row["id"],
+            ticket_no=row["ticket_no"],
+            briefing_id=row["briefing_id"],
+            instrument_id=row["instrument_id"],
+            action=row["action"],
+            units=row["units"],
+            entry_price=row["entry_price"],
+            tp_price=row["tp_price"],
+            sl_price=row["sl_price"],
+            valid_until=date.fromisoformat(row["valid_until"]),
+            rationale=row["rationale"],
+            validator_result_json=row["validator_result_json"],
+            status=row["status"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEventRecord:
+    id: int
+    ts: datetime
+    kind: str
+    detail_json: str
+
+
+class AuditEventRepo:
+    """Append-only log for validator/judgment outcomes (`audit_events`)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(self, kind: str, detail_json: str) -> int:
+        ts = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "INSERT INTO audit_events (ts, kind, detail_json) VALUES (?, ?, ?)",
+            (ts, kind, detail_json),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def list_by_kind(self, kind: str) -> list[AuditEventRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM audit_events WHERE kind = ? ORDER BY id", (kind,)
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def list_all(self) -> list[AuditEventRecord]:
+        rows = self._conn.execute("SELECT * FROM audit_events ORDER BY id").fetchall()
+        return [self._to_record(row) for row in rows]
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> AuditEventRecord:
+        return AuditEventRecord(
+            id=row["id"],
+            ts=datetime.fromisoformat(row["ts"]),
+            kind=row["kind"],
+            detail_json=row["detail_json"],
+        )
