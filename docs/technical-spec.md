@@ -82,7 +82,9 @@ src/llm_fund/
 設計原則: 全テーブル `id INTEGER PRIMARY KEY AUTOINCREMENT`（サロゲートキー）。ナチュラルキーは UNIQUE 制約。人間に露出する識別子は `ticket_no` 等の外部識別子で、内部 PK は露出しない。
 
 ```sql
+universes(id, code TEXT UNIQUE, market, report_enabled, trade_enabled)
 instruments(id, symbol TEXT UNIQUE, name, market, lot_size INTEGER DEFAULT 100, active)
+universe_members(id, universe_id FK, instrument_id FK, UNIQUE(universe_id, instrument_id))
 candles(id, instrument_id FK, date TEXT, open, high, low, close, volume,
         adj_close,                 -- 指標計算は調整後、注文価格は非調整を使用
         UNIQUE(instrument_id, date))
@@ -96,7 +98,7 @@ pending_orders(id, instruction_id FK, expires_at, status)   -- 未約定 IFO・�
 policies(id, effective_from, content, status, approved_at)   -- 月次方針
 criteria(id, effective_from, content, diff, rationale, status, approved_at,
          superseded_by FK NULL)                               -- 週次基準（ロールバック可能）
-briefings(id, date, kind, content_md, data_snapshot_json, created_at)
+briefings(id, universe_id FK, date, kind, content_md, data_snapshot_json, created_at)
 instructions(id, ticket_no TEXT UNIQUE,        -- 例: "20260704-01"（人間向け識別子）
              briefing_id FK, instrument_id FK, action, units,
              entry_price, tp_price, sl_price, valid_until,
@@ -229,8 +231,9 @@ ABSOLUTE_MAX_TURNOVER_PCT = 50.0
 
 | コマンド | 動作 | 起動元 |
 |---|---|---|
-| `fund fetch` | ユニバースの価格を取得しキャッシュ更新 | daily 内からも呼ばれる |
-| `fund daily [--no-llm] [--format json]` | fetch → briefing → 判断 → validation → レポート/通知 | cron（毎営業日朝）/ llm_company |
+| `fund fetch [universe]` | ユニバースの価格を取得しキャッシュ更新 | daily/report 内からも呼ばれる |
+| `fund report [universe] [--format json]` | レポートラインのみ実行（fetch → briefing → 配信。売買判断なし） | cron（市場別タイミング）/ llm_company |
+| `fund daily [--no-llm] [--format json]` | 全 report ユニバースのレポート ＋ trade ユニバースへの判断 → validation → レポート/通知 | cron（毎営業日朝）/ llm_company |
 | `fund weekly` | 振り返り＋基準変更提案（承認待ち状態で保存） | cron（週末）/ llm_company |
 | `fund monthly` | 方針・ユニバース入替提案 | cron（月初）/ llm_company |
 | `fund approve <proposal>` | 週次/月次提案の承認・有効化 | 人間 |
@@ -245,7 +248,7 @@ ABSOLUTE_MAX_TURNOVER_PCT = 50.0
 
 - `.env`: `ANTHROPIC_API_KEY`, `NOTIFY_WEBHOOK_URL`（秘匿）
 - `config/default.yaml`: モデル名、制限値（絶対上限以下のみ有効）、ベンチマーク設定、手数料・スリッページ、出力先
-- `config/universe.yaml`: 監視銘柄（月次提案→`fund approve` で更新）
+- `config/universes.yaml`: 名前付きユニバース複数（例: `jp_stocks`(trade), `us_stocks`(report), `etf`(report)）。各ユニバースに market / report / trade / cadence と銘柄リスト（月次提案→`fund approve` で更新）
 - 起動時に設定値が絶対上限を超えていたら終了コード 3 で abort
 
 ## 10. テスト方針
