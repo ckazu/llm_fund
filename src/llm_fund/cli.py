@@ -3,6 +3,7 @@
 import sqlite3
 from datetime import date
 
+import anthropic
 import typer
 
 from llm_fund.briefing.builder import build_universe_briefing, save_briefing
@@ -10,24 +11,35 @@ from llm_fund.config import AppSettings, ConfigError, load_settings
 from llm_fund.data.loader import DataFreshnessError, PriceLoader
 from llm_fund.data.prices import YFinanceSource
 from llm_fund.delivery.report import write_report
-from llm_fund.domain.models import Candle
+from llm_fund.domain.models import Candle, JudgmentResult
+from llm_fund.judgment import prompts
+from llm_fund.judgment.client import (
+    LlmConfig,
+    gather_consistent_judgment,
+)
+from llm_fund.judgment.template import template_judgment
 from llm_fund.store.db import init_db
 from llm_fund.store.repos import (
+    AuditEventRepo,
     BriefingRepo,
     CandleRepo,
+    InstructionRepo,
     InstrumentRepo,
+    LlmCallRepo,
+    PortfolioStateRepo,
     UniverseRecord,
     UniverseRepo,
+)
+from llm_fund.validator.gate import GateDecision, apply_gate, persist_gate_result
+from llm_fund.validator.rules import (
+    InstrumentContext,
+    RiskLimits,
+    ValidationContext,
 )
 
 DEFAULT_FETCH_LOOKBACK_DAYS = 365
 REPORT_KIND = "report"
 DAILY_KIND = "daily"
-# S4 では判断ライン（judgment/）が未実装のため、trade ユニバースは常に NO_TRADE 固定。
-# S6 で LLM/テンプレート判断が入るまでこの理由文言を使う。
-NO_TRADE_REASON_JUDGMENT_NOT_IMPLEMENTED = (
-    "判断ライン未実装（S6 で実装予定）。現状は常に NO_TRADE。"
-)
 
 app = typer.Typer(help="LLM-powered investment fund manager CLI")
 
@@ -85,34 +97,28 @@ def _build_report_markdown(
     as_of: date,
     kind: str,
     lookback_days: int,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], dict[str, int], dict[str, dict[str, list[Candle]]]]:
     """Build combined Markdown for `codes`, saving one `briefings` row per universe.
 
-    Returns `(content_md, stale_messages)`.
+    Returns `(content_md, stale_messages, briefing_ids, candles_by_code)`. The latter
+    two let the trade line reuse the briefing row and candles already fetched here,
+    avoiding a second yfinance round trip for universes that are both report and trade.
     """
     briefing_repo = BriefingRepo(conn)
     sections: list[str] = []
     stale_messages: list[str] = []
+    briefing_ids: dict[str, int] = {}
+    candles_by_code: dict[str, dict[str, list[Candle]]] = {}
     for code in codes:
         universe_record, candles_by_symbol, stale = _sync_and_load_universe(
             settings, conn, code, as_of, lookback_days
         )
         stale_messages.extend(stale)
+        candles_by_code[code] = candles_by_symbol
         briefing = build_universe_briefing(code, kind, as_of, candles_by_symbol)
-        save_briefing(briefing_repo, universe_record.id, briefing)
+        briefing_ids[code] = save_briefing(briefing_repo, universe_record.id, briefing)
         sections.append(briefing.content_md)
-    return "\n".join(sections), stale_messages
-
-
-def _render_no_trade_section(trade_codes: list[str]) -> str:
-    """Fixed NO_TRADE section for trade-enabled universes (judgment line lands in S6)."""
-    lines = ["## 売買判断（Trade Line）\n\n"]
-    if not trade_codes:
-        lines.append("対象ユニバースなし\n")
-        return "".join(lines)
-    for code in trade_codes:
-        lines.append(f"- {code}: NO_TRADE — {NO_TRADE_REASON_JUDGMENT_NOT_IMPLEMENTED}\n")
-    return "".join(lines)
+    return "\n".join(sections), stale_messages, briefing_ids, candles_by_code
 
 
 @app.command()
@@ -150,7 +156,7 @@ def report(
 
     as_of = _resolve_as_of(date)
     conn = init_db(settings.db_path)
-    content_md, stale_messages = _build_report_markdown(
+    content_md, stale_messages, _, _ = _build_report_markdown(
         settings, conn, codes, as_of, REPORT_KIND, DEFAULT_FETCH_LOOKBACK_DAYS
     )
 
@@ -163,6 +169,217 @@ def report(
     typer.echo(f"[report] universes={codes} format={format_} written to {out_path}")
 
 
+def _build_validation_context(
+    settings: AppSettings,
+    conn: sqlite3.Connection,
+    candles_by_symbol: dict[str, list[Candle]],
+    data_fresh: bool,
+) -> tuple[ValidationContext, dict[str, int]]:
+    """Build a `ValidationContext` + symbol->instrument_id map for the gate.
+
+    NAV/cash come from `portfolio_state` (latest snapshot; 0 when uninitialised, which
+    conservatively rejects every BUY). Positions are unavailable until S8, so held units
+    and current exposure are 0. `prev_close` uses the latest non-adjusted close.
+    """
+    portfolio = PortfolioStateRepo(conn).latest()
+    nav = portfolio.nav if portfolio is not None else 0.0
+    cash = portfolio.cash if portfolio is not None else 0.0
+
+    instrument_repo = InstrumentRepo(conn)
+    instruments: dict[str, InstrumentContext] = {}
+    instrument_id_by_symbol: dict[str, int] = {}
+    for symbol, candles in candles_by_symbol.items():
+        if not candles:
+            continue
+        record = instrument_repo.get_by_symbol(symbol)
+        if record is None:
+            continue
+        instrument_id_by_symbol[symbol] = record.id
+        instruments[symbol] = InstrumentContext(
+            symbol=symbol,
+            in_universe=True,
+            lot_size=record.lot_size,
+            prev_close=candles[-1].close,
+            current_units=0,
+        )
+
+    ctx = ValidationContext(
+        nav=nav,
+        cash=cash,
+        current_exposure=0.0,
+        instruments=instruments,
+        limits=RiskLimits.from_settings(settings.limits),
+        data_fresh=data_fresh,
+    )
+    return ctx, instrument_id_by_symbol
+
+
+def _run_judgment(
+    settings: AppSettings,
+    conn: sqlite3.Connection,
+    *,
+    briefing_md: str,
+    as_of: date,
+    briefing_id: int,
+) -> tuple[JudgmentResult, float]:
+    """Run the LLM self-consistency gate and return `(judgment, disagreement_rate)`."""
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    config = LlmConfig(
+        model=settings.llm.model,
+        temperature=settings.judgment.temperature,
+        max_tokens=settings.judgment.max_tokens,
+        n_samples=settings.judgment.n_samples,
+    )
+    portfolio = PortfolioStateRepo(conn).latest()
+    nav = portfolio.nav if portfolio is not None else 0.0
+    cash = portfolio.cash if portfolio is not None else 0.0
+    user_prompt = prompts.build_user_prompt(
+        briefing_md=briefing_md,
+        portfolio_summary=prompts.format_portfolio_ratio(nav, cash, {}),
+    )
+    decision = gather_consistent_judgment(
+        client,
+        config,
+        system=prompts.SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        as_of=as_of,
+        prompt_version=prompts.PROMPT_VERSION,
+        briefing_id=briefing_id,
+        llm_call_sink=LlmCallRepo(conn),
+        audit_sink=AuditEventRepo(conn),
+    )
+    return decision.judgment, decision.disagreement_rate
+
+
+def _run_trade_line(
+    settings: AppSettings,
+    conn: sqlite3.Connection,
+    code: str,
+    as_of: date,
+    *,
+    no_llm: bool,
+    briefing_id: int,
+    briefing_md: str,
+    candles_by_symbol: dict[str, list[Candle]],
+) -> str:
+    """Judge -> validate -> persist -> render one trade universe's Markdown section."""
+    expected = {inst.symbol for inst in settings.universes[code].instruments}
+    present = {symbol for symbol, candles in candles_by_symbol.items() if candles}
+    data_fresh = expected.issubset(present)
+
+    disagreement: float | None = None
+    if no_llm:
+        judgment: JudgmentResult | None = template_judgment()
+    elif not data_fresh:
+        # 鮮度違反時は課金前に LLM をスキップし、ゲートに NO_TRADE を強制させる。
+        judgment = None
+    else:
+        judgment, disagreement = _run_judgment(
+            settings, conn, briefing_md=briefing_md, as_of=as_of, briefing_id=briefing_id
+        )
+
+    ctx, instrument_id_by_symbol = _build_validation_context(
+        settings, conn, candles_by_symbol, data_fresh
+    )
+    instruction_repo = InstructionRepo(conn)
+    if judgment is None:
+        gate_decision = apply_gate([], ctx, as_of, instruction_repo.next_sequence(as_of))
+    elif judgment.no_trade:
+        gate_decision = GateDecision(no_trade=True, no_trade_reason=judgment.no_trade_reason)
+    else:
+        gate_decision = apply_gate(
+            judgment.orders, ctx, as_of, instruction_repo.next_sequence(as_of)
+        )
+
+    persist_gate_result(
+        gate_decision,
+        instruction_repo,
+        AuditEventRepo(conn),
+        briefing_id=briefing_id,
+        instrument_id_by_symbol=instrument_id_by_symbol,
+    )
+    return _render_trade_section(code, gate_decision, disagreement, no_llm=no_llm)
+
+
+def _render_trade_section(
+    code: str,
+    decision: GateDecision,
+    disagreement_rate: float | None,
+    *,
+    no_llm: bool,
+) -> str:
+    """Render validated instructions, rejections, warnings and disagreement for one universe."""
+    mode = "テンプレート判断（--no-llm）" if no_llm else "LLM 自己一致性判断"
+    lines = [f"### {code}\n", f"- モード: {mode}\n"]
+    if disagreement_rate is not None:
+        lines.append(f"- 不一致率: {disagreement_rate * 100:.1f}%\n")
+    if decision.no_trade:
+        lines.append(f"- {code}: NO_TRADE — {decision.no_trade_reason}\n")
+    if decision.validated:
+        lines.append("- 指示:\n")
+        for vi in decision.validated:
+            warn = f"（警告: {'; '.join(vi.warnings)}）" if vi.warnings else ""
+            lines.append(
+                f"  - {vi.ticket_no} {vi.action.value} {vi.symbol} {vi.units}株 "
+                f"entry={vi.entry_price:.1f} tp={vi.tp_price:.1f} "
+                f"sl={vi.sl_price:.1f}{warn}\n"
+            )
+    elif not decision.no_trade:
+        lines.append(f"- {code}: 承認された指示なし\n")
+    if decision.rejections:
+        lines.append("- 拒否:\n")
+        for rej in decision.rejections:
+            lines.append(
+                f"  - {rej.order.symbol} {rej.order.action.value} — "
+                f"{'; '.join(rej.reasons)}\n"
+            )
+    return "".join(lines)
+
+
+def _render_trade_line(
+    settings: AppSettings,
+    conn: sqlite3.Connection,
+    trade_codes: list[str],
+    as_of: date,
+    *,
+    no_llm: bool,
+    briefing_ids: dict[str, int],
+    candles_by_code: dict[str, dict[str, list[Candle]]],
+) -> str:
+    """Run the trade line for every trade-enabled universe and combine their sections."""
+    header = "## 売買判断（Trade Line）\n\n"
+    if not trade_codes:
+        return header + "対象ユニバースなし\n"
+
+    sections: list[str] = []
+    for code in trade_codes:
+        candles_by_symbol = candles_by_code.get(code)
+        briefing_id = briefing_ids.get(code)
+        if candles_by_symbol is None or briefing_id is None:
+            # trade-only ユニバース（report 対象外）はここで初めて取得しブリーフィングを保存する。
+            universe_record, candles_by_symbol, _ = _sync_and_load_universe(
+                settings, conn, code, as_of, DEFAULT_FETCH_LOOKBACK_DAYS
+            )
+            briefing = build_universe_briefing(code, DAILY_KIND, as_of, candles_by_symbol)
+            briefing_id = save_briefing(BriefingRepo(conn), universe_record.id, briefing)
+        briefing_md = build_universe_briefing(
+            code, DAILY_KIND, as_of, candles_by_symbol
+        ).content_md
+        sections.append(
+            _run_trade_line(
+                settings,
+                conn,
+                code,
+                as_of,
+                no_llm=no_llm,
+                briefing_id=briefing_id,
+                briefing_md=briefing_md,
+                candles_by_symbol=candles_by_symbol,
+            )
+        )
+    return header + "\n".join(sections)
+
+
 @app.command()
 def daily(
     date: str | None = typer.Option(None, help="Target date (YYYY-MM-DD). Defaults to today."),
@@ -173,10 +390,10 @@ def daily(
         "markdown", "--format", help="Output format: markdown, json"
     ),
 ) -> None:
-    """Generate the daily briefing for all report universes, plus trading instructions.
+    """Report all report universes, then judge -> validate -> record for trade universes.
 
-    Trading judgment (LLM/template) lands in S6 (validator in S5); until then
-    trade-enabled universes always report NO_TRADE.
+    Aborts with exit code 2 if any report universe's data is stale, or 3 if config is
+    invalid (or the LLM path is requested without an API key). NO_TRADE is exit 0.
     """
     try:
         settings = load_settings()
@@ -187,9 +404,16 @@ def daily(
     report_codes = [code for code, conf in settings.universes.items() if conf.report]
     trade_codes = [code for code, conf in settings.universes.items() if conf.trade]
 
+    if not no_llm and trade_codes and settings.anthropic_api_key is None:
+        typer.echo(
+            "[daily] ANTHROPIC_API_KEY 未設定。--no-llm を使うか .env に設定してください。",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
     as_of = _resolve_as_of(date)
     conn = init_db(settings.db_path)
-    content_md, stale_messages = _build_report_markdown(
+    content_md, stale_messages, briefing_ids, candles_by_code = _build_report_markdown(
         settings, conn, report_codes, as_of, DAILY_KIND, DEFAULT_FETCH_LOOKBACK_DAYS
     )
 
@@ -198,7 +422,16 @@ def daily(
             typer.echo(f"[daily] stale: {message}", err=True)
         raise typer.Exit(code=2)
 
-    full_content = content_md + "\n" + _render_no_trade_section(trade_codes)
+    trade_md = _render_trade_line(
+        settings,
+        conn,
+        trade_codes,
+        as_of,
+        no_llm=no_llm,
+        briefing_ids=briefing_ids,
+        candles_by_code=candles_by_code,
+    )
+    full_content = content_md + "\n" + trade_md
     out_path = write_report(settings.report.output_dir, as_of, DAILY_KIND, full_content)
     typer.echo(
         f"[daily] date={as_of.isoformat()}, no_llm={no_llm}, format={format_} -> {out_path}"

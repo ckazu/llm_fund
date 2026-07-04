@@ -426,6 +426,100 @@ class InstructionRepo:
 
 
 @dataclass(frozen=True, slots=True)
+class LlmCallRecord:
+    id: int
+    ts: datetime
+    kind: str
+    model: str
+    temperature: float
+    prompt_version: str
+    schema_version: int
+    sample_index: int
+    briefing_id: int | None
+    policy_id: int | None
+    criteria_id: int | None
+    prompt: str
+    response: str | None
+    token_usage_json: str | None
+
+
+class LlmCallRepo:
+    """Append-only audit log of every LLM API call (`llm_calls`, technical-spec.md 3, 5章).
+
+    Records prompt/response/model/temperature/prompt_version/sample_index/token usage so
+    each judgment is reproducible and benchmark aggregation can be partitioned by
+    prompt_version + model + temperature (評価プロトコルの固定).
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(
+        self,
+        *,
+        kind: str,
+        model: str,
+        temperature: float,
+        prompt_version: str,
+        schema_version: int,
+        sample_index: int,
+        prompt: str,
+        response: str | None,
+        token_usage_json: str | None,
+        briefing_id: int | None = None,
+        policy_id: int | None = None,
+        criteria_id: int | None = None,
+    ) -> int:
+        ts = datetime.now(UTC).isoformat()
+        cur = self._conn.execute(
+            "INSERT INTO llm_calls "
+            "(ts, kind, model, temperature, prompt_version, schema_version, sample_index, "
+            "policy_id, criteria_id, briefing_id, prompt, response, token_usage_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ts,
+                kind,
+                model,
+                temperature,
+                prompt_version,
+                schema_version,
+                sample_index,
+                policy_id,
+                criteria_id,
+                briefing_id,
+                prompt,
+                response,
+                token_usage_json,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def list_all(self) -> list[LlmCallRecord]:
+        rows = self._conn.execute("SELECT * FROM llm_calls ORDER BY id").fetchall()
+        return [self._to_record(row) for row in rows]
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> LlmCallRecord:
+        return LlmCallRecord(
+            id=row["id"],
+            ts=datetime.fromisoformat(row["ts"]),
+            kind=row["kind"],
+            model=row["model"],
+            temperature=row["temperature"],
+            prompt_version=row["prompt_version"],
+            schema_version=row["schema_version"],
+            sample_index=row["sample_index"],
+            briefing_id=row["briefing_id"],
+            policy_id=row["policy_id"],
+            criteria_id=row["criteria_id"],
+            prompt=row["prompt"],
+            response=row["response"],
+            token_usage_json=row["token_usage_json"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AuditEventRecord:
     id: int
     ts: datetime

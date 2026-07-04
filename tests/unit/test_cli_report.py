@@ -137,7 +137,7 @@ class TestDailyCommand:
     ) -> None:
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(date.today()))
 
-        result = runner.invoke(app, ["daily"])
+        result = runner.invoke(app, ["daily", "--no-llm"])
 
         assert result.exit_code == 0, result.output
         content = (
@@ -151,7 +151,7 @@ class TestDailyCommand:
     ) -> None:
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(date.today()))
 
-        result = runner.invoke(app, ["daily"])
+        result = runner.invoke(app, ["daily", "--no-llm"])
 
         assert result.exit_code == 0, result.output
         content = (
@@ -167,7 +167,7 @@ class TestDailyCommand:
         stale_date = date.today() - timedelta(days=30)
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(stale_date))
 
-        result = runner.invoke(app, ["daily"])
+        result = runner.invoke(app, ["daily", "--no-llm"])
 
         assert result.exit_code == 2
 

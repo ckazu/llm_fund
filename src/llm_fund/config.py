@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from llm_fund.domain.models import MAX_DAILY_TICKET_SEQUENCE
+from llm_fund.judgment.client import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_N_SAMPLES,
+    DEFAULT_TEMPERATURE,
+)
 from llm_fund.validator.rules import (
     ABSOLUTE_MAX_POSITION_PCT,
     ABSOLUTE_MAX_TURNOVER_PCT,
@@ -33,6 +38,22 @@ class ConfigError(Exception):
 class LLMSettings(BaseModel):
     model: str
     ratio_only: bool = True
+
+
+class JudgmentSettings(BaseModel):
+    """自己一致性・LLM 呼び出しパラメータ（technical-spec.md 5章。任意。既定で 3 サンプル）。"""
+
+    n_samples: int = DEFAULT_N_SAMPLES
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+
+    @model_validator(mode="after")
+    def _check_positive(self) -> "JudgmentSettings":
+        if self.n_samples < 1:
+            raise ConfigError(f"judgment.n_samples={self.n_samples} must be >= 1")
+        if self.max_tokens < 1:
+            raise ConfigError(f"judgment.max_tokens={self.max_tokens} must be >= 1")
+        return self
 
 
 class LimitsSettings(BaseModel):
@@ -109,6 +130,7 @@ class AppSettings(BaseSettings):
     benchmark: BenchmarkSettings
     report: ReportSettings
     data: DataSettings = Field(default_factory=DataSettings)
+    judgment: JudgmentSettings = Field(default_factory=JudgmentSettings)
     universes: dict[str, UniverseConfig]
 
 
