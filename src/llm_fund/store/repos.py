@@ -15,7 +15,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
-from llm_fund.domain.enums import ExecutionStatus
+from llm_fund.domain.enums import ExecutionStatus, ProposalStatus
 from llm_fund.domain.models import Candle
 
 # 東証の一般的な売買単位（100株）。instruments.lot_size の既定値。
@@ -586,6 +586,191 @@ class AuditEventRepo:
             ts=datetime.fromisoformat(row["ts"]),
             kind=row["kind"],
             detail_json=row["detail_json"],
+        )
+
+
+# --- S9 review（週次/月次レビューサイクル）------------------------------------
+# `policies`/`criteria` は月次方針・週次基準の承認ライフサイクルを保持する
+# （technical-spec.md 3章）。両テーブルとも新規提案は status=draft で書かれ、
+# `approve()` が承認・旧版の supersede を1トランザクション相当（同一 conn）で行う。
+# criteria のみ `superseded_by` を持つため、superseded になった行を再度 approve()
+# すればそれが再度 active になり、直前の active 版が supersede される
+# （= ロールバック。FR-6「人間承認で有効化、ロールバック可能」）。
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyRecord:
+    id: int
+    effective_from: date
+    content: str
+    status: str
+    approved_at: datetime | None
+
+
+class PolicyRepo:
+    """月次方針の承認ライフサイクル（`policies`）。"""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(
+        self,
+        *,
+        effective_from: date,
+        content: str,
+        status: str = ProposalStatus.DRAFT.value,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO policies (effective_from, content, status, approved_at) "
+            "VALUES (?, ?, ?, NULL)",
+            (effective_from.isoformat(), content, status),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_id(self, policy_id: int) -> PolicyRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM policies WHERE id = ?", (policy_id,)
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def get_active(self) -> PolicyRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM policies WHERE status = ? ORDER BY approved_at DESC LIMIT 1",
+            (ProposalStatus.ACTIVE.value,),
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def list_by_status(self, status: str) -> list[PolicyRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM policies WHERE status = ? ORDER BY id", (status,)
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def approve(self, policy_id: int) -> None:
+        """`policy_id` を active 化し、既存の active 版を superseded にする。
+
+        ロールバックは既に superseded になった旧版を再度 approve() することで行う
+        （承認とロールバックで同じメソッドを共用する）。
+        """
+        target = self.get_by_id(policy_id)
+        if target is None:
+            raise ValueError(f"unknown policy id: {policy_id}")
+
+        current_active = self.get_active()
+        if current_active is not None and current_active.id != policy_id:
+            self._conn.execute(
+                "UPDATE policies SET status = ? WHERE id = ?",
+                (ProposalStatus.SUPERSEDED.value, current_active.id),
+            )
+        approved_at = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE policies SET status = ?, approved_at = ? WHERE id = ?",
+            (ProposalStatus.ACTIVE.value, approved_at, policy_id),
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> PolicyRecord:
+        return PolicyRecord(
+            id=row["id"],
+            effective_from=date.fromisoformat(row["effective_from"]),
+            content=row["content"],
+            status=row["status"],
+            approved_at=datetime.fromisoformat(row["approved_at"]) if row["approved_at"] else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CriteriaRecord:
+    id: int
+    effective_from: date
+    content: str
+    diff: str | None
+    rationale: str | None
+    status: str
+    approved_at: datetime | None
+    superseded_by: int | None
+
+
+class CriteriaRepo:
+    """週次基準の承認ライフサイクル（`criteria`。ロールバック可能な `superseded_by` 付き）。"""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def add(
+        self,
+        *,
+        effective_from: date,
+        content: str,
+        diff: str | None,
+        rationale: str | None,
+        status: str = ProposalStatus.DRAFT.value,
+    ) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO criteria "
+            "(effective_from, content, diff, rationale, status, approved_at, superseded_by) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+            (effective_from.isoformat(), content, diff, rationale, status),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)  # type: ignore[arg-type]
+
+    def get_by_id(self, criteria_id: int) -> CriteriaRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM criteria WHERE id = ?", (criteria_id,)
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def get_active(self) -> CriteriaRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM criteria WHERE status = ? ORDER BY approved_at DESC LIMIT 1",
+            (ProposalStatus.ACTIVE.value,),
+        ).fetchone()
+        return self._to_record(row) if row else None
+
+    def list_by_status(self, status: str) -> list[CriteriaRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM criteria WHERE status = ? ORDER BY id", (status,)
+        ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def approve(self, criteria_id: int) -> None:
+        """`criteria_id` を active 化する（承認/ロールバック共用）。
+
+        既存の active 版があれば `status=superseded` にし `superseded_by=criteria_id`
+        を記録する。superseded になった版を改めて approve() すればそれが active に
+        戻り、直前の active 版が supersede される（ロールバック）。
+        """
+        target = self.get_by_id(criteria_id)
+        if target is None:
+            raise ValueError(f"unknown criteria id: {criteria_id}")
+
+        current_active = self.get_active()
+        if current_active is not None and current_active.id != criteria_id:
+            self._conn.execute(
+                "UPDATE criteria SET status = ?, superseded_by = ? WHERE id = ?",
+                (ProposalStatus.SUPERSEDED.value, criteria_id, current_active.id),
+            )
+        approved_at = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            "UPDATE criteria SET status = ?, approved_at = ?, superseded_by = NULL WHERE id = ?",
+            (ProposalStatus.ACTIVE.value, approved_at, criteria_id),
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> CriteriaRecord:
+        return CriteriaRecord(
+            id=row["id"],
+            effective_from=date.fromisoformat(row["effective_from"]),
+            content=row["content"],
+            diff=row["diff"],
+            rationale=row["rationale"],
+            status=row["status"],
+            approved_at=datetime.fromisoformat(row["approved_at"]) if row["approved_at"] else None,
+            superseded_by=row["superseded_by"],
         )
 
 

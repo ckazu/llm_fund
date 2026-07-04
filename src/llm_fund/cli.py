@@ -1,5 +1,6 @@
 """CLI entry point for llm_fund."""
 
+import json
 import sqlite3
 from datetime import UTC, date, datetime
 
@@ -19,15 +20,30 @@ from llm_fund.judgment.client import (
     gather_consistent_judgment,
 )
 from llm_fund.judgment.template import template_judgment
+from llm_fund.review.monthly import (
+    AUDIT_KIND_POLICY_APPROVED,
+    render_benchmark_performance_md,
+    render_monthly_result_md,
+    run_monthly_review,
+)
+from llm_fund.review.monthly import PROMPT_VERSION as MONTHLY_PROMPT_VERSION
+from llm_fund.review.weekly import (
+    AUDIT_KIND_CRITERIA_APPROVED,
+    render_weekly_result_md,
+    run_weekly_review,
+)
+from llm_fund.review.weekly import PROMPT_VERSION as WEEKLY_PROMPT_VERSION
 from llm_fund.store.db import init_db
 from llm_fund.store.repos import (
     AuditEventRepo,
     BriefingRepo,
     CandleRepo,
+    CriteriaRepo,
     ExecutionRepo,
     InstructionRepo,
     InstrumentRepo,
     LlmCallRepo,
+    PolicyRepo,
     PortfolioStateRepo,
     UniverseRecord,
     UniverseRepo,
@@ -448,6 +464,26 @@ def daily(
     )
 
 
+def _require_llm_settings(settings: AppSettings, command: str) -> anthropic.Anthropic:
+    """Abort with exit code 3 if no API key is configured, else return an anthropic client."""
+    if settings.anthropic_api_key is None:
+        typer.echo(
+            f"[{command}] ANTHROPIC_API_KEY 未設定。.env に設定してください。", err=True
+        )
+        raise typer.Exit(code=3)
+    return anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+
+def _review_llm_config(settings: AppSettings) -> LlmConfig:
+    """`weekly`/`monthly` は自己一致性チェックを行わない単発呼び出し（n_samples=1）。"""
+    return LlmConfig(
+        model=settings.llm.model,
+        temperature=settings.judgment.temperature,
+        max_tokens=settings.judgment.max_tokens,
+        n_samples=1,
+    )
+
+
 @app.command()
 def weekly(
     date: str | None = typer.Option(None, help="Target date (YYYY-MM-DD). Defaults to today."),
@@ -455,11 +491,33 @@ def weekly(
         "markdown", "--format", help="Output format: markdown, json"
     ),
 ) -> None:
-    """Review past week's trades and propose criteria adjustments.
+    """Review past week's trades and propose criteria adjustments (FR-6).
 
-    Analyzes execution performance and recommends updates to IFO parameters.
+    Analyzes virtual-fill performance and IFO width, and proposes a criteria
+    change (diff + rationale) saved as `status=draft`. Requires human approval
+    via `fund approve criteria:<id>` before it takes effect.
     """
-    typer.echo(f"[weekly] date={date}, format={format_} (not yet implemented)")
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        typer.echo(f"[weekly] config error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    client = _require_llm_settings(settings, "weekly")
+    as_of = _resolve_as_of(date)
+    conn = init_db(settings.db_path)
+
+    result = run_weekly_review(
+        conn,
+        client,
+        _review_llm_config(settings),
+        as_of=as_of,
+        prompt_version=WEEKLY_PROMPT_VERSION,
+        llm_call_sink=LlmCallRepo(conn),
+        audit_sink=AuditEventRepo(conn),
+    )
+    typer.echo(render_weekly_result_md(result))
+    typer.echo(f"[weekly] date={as_of.isoformat()} format={format_} no_change={result.no_change}")
 
 
 @app.command()
@@ -469,11 +527,101 @@ def monthly(
         "markdown", "--format", help="Output format: markdown, json"
     ),
 ) -> None:
-    """Review past month's performance and propose policy/universe changes.
+    """Review past month's performance and propose policy/universe changes (FR-6).
 
-    Recommends updates to monthly policy and universe membership.
+    Compares LLM vs. control-group NAV and proposes a policy change (diff +
+    rationale) saved as `status=draft`, plus any universe change suggestions
+    recorded to `audit_events` for manual reflection into
+    `config/universes.yaml`. Requires human approval via `fund approve
+    policy:<id>` before the policy change takes effect.
     """
-    typer.echo(f"[monthly] date={date}, format={format_} (not yet implemented)")
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        typer.echo(f"[monthly] config error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    client = _require_llm_settings(settings, "monthly")
+    as_of = _resolve_as_of(date)
+    conn = init_db(settings.db_path)
+
+    summary = _run_tracking(settings, conn, as_of)
+    performance_md = render_benchmark_performance_md(summary)
+    result = run_monthly_review(
+        conn,
+        client,
+        _review_llm_config(settings),
+        as_of=as_of,
+        prompt_version=MONTHLY_PROMPT_VERSION,
+        performance_summary=performance_md,
+        llm_call_sink=LlmCallRepo(conn),
+        audit_sink=AuditEventRepo(conn),
+    )
+    typer.echo(render_monthly_result_md(result, performance_md))
+    typer.echo(
+        f"[monthly] date={as_of.isoformat()} format={format_} no_change={result.no_change}"
+    )
+
+
+@app.command()
+def approve(
+    proposal: str = typer.Argument(
+        ..., help="Proposal id as 'criteria:<id>' or 'policy:<id>' (from fund weekly/monthly)."
+    ),
+) -> None:
+    """Approve a weekly criteria or monthly policy proposal (FR-6).
+
+    Activates the given proposal and marks the previously active version of
+    the same kind as superseded. Approving a superseded criteria/policy again
+    reactivates it and supersedes the current one -- this is the rollback path.
+    """
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        typer.echo(f"[approve] config error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+
+    kind, sep, id_str = proposal.partition(":")
+    if not sep or not id_str.isdigit():
+        typer.echo(
+            f"[approve] invalid proposal: {proposal!r} "
+            "(expected 'criteria:<id>' or 'policy:<id>')",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    proposal_id = int(id_str)
+
+    conn = init_db(settings.db_path)
+    audit_repo = AuditEventRepo(conn)
+
+    if kind == "criteria":
+        criteria_repo = CriteriaRepo(conn)
+        if criteria_repo.get_by_id(proposal_id) is None:
+            typer.echo(f"[approve] unknown criteria id: {proposal_id}", err=True)
+            raise typer.Exit(code=1)
+        criteria_repo.approve(proposal_id)
+        audit_repo.add(
+            AUDIT_KIND_CRITERIA_APPROVED,
+            json.dumps({"criteria_id": proposal_id}, ensure_ascii=False),
+        )
+        typer.echo(f"[approve] criteria:{proposal_id} activated")
+    elif kind == "policy":
+        policy_repo = PolicyRepo(conn)
+        if policy_repo.get_by_id(proposal_id) is None:
+            typer.echo(f"[approve] unknown policy id: {proposal_id}", err=True)
+            raise typer.Exit(code=1)
+        policy_repo.approve(proposal_id)
+        audit_repo.add(
+            AUDIT_KIND_POLICY_APPROVED,
+            json.dumps({"policy_id": proposal_id}, ensure_ascii=False),
+        )
+        typer.echo(f"[approve] policy:{proposal_id} activated")
+    else:
+        typer.echo(
+            f"[approve] unknown proposal kind: {kind!r} (expected 'criteria' or 'policy')",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command()
