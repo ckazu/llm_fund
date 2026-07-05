@@ -1,8 +1,9 @@
 """CLI tests for `fund weekly` / `fund monthly` / `fund approve` (S9: FR-6).
 
-Covers the end-to-end state transition with anthropic fully mocked: proposal
-generation -> `fund approve` activates it -> a second proposal supersedes the
-first -> re-approving the first rolls back (its `superseded_by` link flips).
+Covers the end-to-end state transition with the LLM backend fully mocked
+(`FakeBackend` + a patched router; no subprocess / HTTP): proposal generation ->
+`fund approve` activates it -> a second proposal supersedes the first ->
+re-approving the first rolls back (its `superseded_by` link flips).
 """
 
 from pathlib import Path
@@ -16,17 +17,19 @@ from llm_fund.cli import app
 from llm_fund.domain.enums import ProposalStatus
 from llm_fund.store.db import init_db
 from llm_fund.store.repos import CriteriaRepo, PolicyRepo
+from tests.factories import build_llm_config_dict
+from tests.fakes import FakeBackend, FakeRouter
 
 runner = CliRunner()
 
 
-def _write_config(tmp_path: Path) -> None:
+def _write_config(tmp_path: Path, *, claude_command: str = "claude") -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "default.yaml").write_text(
         yaml.safe_dump(
             {
-                "llm": {"model": "claude-sonnet-5"},
+                "llm": build_llm_config_dict(command=claude_command),
                 "limits": {
                     "max_position_pct": 15.0,
                     "max_turnover_pct": 30.0,
@@ -48,33 +51,17 @@ def _write_config(tmp_path: Path) -> None:
 @pytest.fixture
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     _write_config(tmp_path)
     return tmp_path
 
 
-class _Msg:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.content = [type("B", (), {"type": "tool_use", "input": payload})()]
-        self.usage = type("U", (), {"input_tokens": 5, "output_tokens": 5})()
-
-
-class _FakeAnthropic:
-    """Returns each payload in `payloads` in order (one per `.messages.create()` call)."""
-
-    def __init__(self, payloads: list[dict[str, Any]]) -> None:
-        self._payloads = list(payloads)
-        self.call_count = 0
-
-        outer = self
-
-        class _Messages:
-            def create(self, **kwargs: Any) -> _Msg:
-                payload = outer._payloads[min(outer.call_count, len(outer._payloads) - 1)]
-                outer.call_count += 1
-                return _Msg(payload)
-
-        self.messages = _Messages()
+def _patch_backend(
+    monkeypatch: pytest.MonkeyPatch, payloads: list[dict[str, Any]]
+) -> FakeBackend:
+    """Route every role to a FakeBackend returning `payloads` in order."""
+    fake = FakeBackend(payloads, repeat_last=True)
+    monkeypatch.setattr("llm_fund.cli.build_router", lambda settings: FakeRouter(fake))
+    return fake
 
 
 def _criteria_payload(diff: str, rationale: str) -> dict[str, Any]:
@@ -89,8 +76,7 @@ def _criteria_payload(diff: str, rationale: str) -> dict[str, Any]:
 
 class TestWeeklyProposeApproveRollback:
     def test_full_lifecycle(self, project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        fake = _FakeAnthropic([_criteria_payload("SL幅拡大", "勝率低下")])
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+        fake = _patch_backend(monkeypatch, [_criteria_payload("SL幅拡大", "勝率低下")])
 
         result = runner.invoke(app, ["weekly"])
         assert result.exit_code == 0, result.output
@@ -110,8 +96,7 @@ class TestWeeklyProposeApproveRollback:
         assert active.id == old_id
 
         # A second weekly run proposes and approves a new version, superseding the first.
-        fake.call_count = 0
-        fake._payloads = [_criteria_payload("SL幅さらに拡大", "継続的な損切り過小")]
+        fake._script[:] = [_criteria_payload("SL幅さらに拡大", "継続的な損切り過小")]
         result2 = runner.invoke(app, ["weekly"])
         assert result2.exit_code == 0, result2.output
 
@@ -158,10 +143,11 @@ class TestApproveErrors:
         result = runner.invoke(app, ["approve", "criteria:999"])
         assert result.exit_code == 1
 
-    def test_missing_api_key_exits_config_error(
-        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    def test_missing_claude_command_exits_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, claude_command="no-such-claude-cmd")
         result = runner.invoke(app, ["weekly"])
         assert result.exit_code == 3
 
@@ -170,7 +156,8 @@ class TestMonthlyProposeApprove:
     def test_policy_proposal_activates(
         self, project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake = _FakeAnthropic(
+        _patch_backend(
+            monkeypatch,
             [
                 {
                     "schema_version": 1,
@@ -180,9 +167,8 @@ class TestMonthlyProposeApprove:
                     "rationale": "対照群に継続劣後",
                     "universe_changes": [],
                 }
-            ]
+            ],
         )
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
 
         result = runner.invoke(app, ["monthly"])
         assert result.exit_code == 0, result.output
@@ -204,10 +190,10 @@ class TestMonthlyProposeApprove:
     def test_no_change_reports_and_persists_nothing(
         self, project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake = _FakeAnthropic(
-            [{"schema_version": 1, "no_change": True, "rationale": "有意な劣後なし"}]
+        _patch_backend(
+            monkeypatch,
+            [{"schema_version": 1, "no_change": True, "rationale": "有意な劣後なし"}],
         )
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
 
         result = runner.invoke(app, ["monthly"])
         assert result.exit_code == 0, result.output

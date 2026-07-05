@@ -17,6 +17,7 @@ from llm_fund.store.repos import (
     InstrumentRepo,
     UniverseRepo,
 )
+from tests.factories import build_llm_config_dict
 
 runner = CliRunner()
 
@@ -29,7 +30,7 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (config_dir / "default.yaml").write_text(
         yaml.safe_dump(
             {
-                "llm": {"model": "claude-sonnet-5"},
+                "llm": build_llm_config_dict(),
                 "limits": {
                     "max_position_pct": 15.0,
                     "max_turnover_pct": 30.0,

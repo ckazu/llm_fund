@@ -11,3 +11,4 @@ reports/
 .coverage
 dist/
 scratch/
+llm_fund.db

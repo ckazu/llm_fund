@@ -1,14 +1,14 @@
 """Unit tests for `review/weekly.py` (S9: FR-6 週次レビュー)。
 
-Anthropic is fully mocked (fake `.messages.create`). Covers: proposal generation
-persists a draft `criteria` row + audit event, no_change short-circuits persistence,
-and schema-validation failure falls back to no_change without raising.
+The LLM backend is a deterministic `FakeBackend` (no subprocess / HTTP). Covers:
+proposal generation persists a draft `criteria` row + audit event, no_change
+short-circuits persistence, and schema-validation failure falls back to
+no_change without raising.
 """
 
 import sqlite3
 from datetime import date
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -21,6 +21,7 @@ from llm_fund.review.weekly import (
 )
 from llm_fund.store.db import apply_migrations, connect
 from llm_fund.store.repos import AuditEventRepo, CriteriaRepo, LlmCallRepo
+from tests.fakes import FAKE_MODEL_LABEL, FakeBackend
 
 PROMPT_VERSION = "test.1"
 
@@ -32,39 +33,21 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
     return c
 
 
-class _Msg:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.content = [type("B", (), {"type": "tool_use", "input": payload})()]
-        self.usage = type("U", (), {"input_tokens": 5, "output_tokens": 5})()
-
-
-class _FakeAnthropic:
-    """Returns `payload` on every `.messages.create()` call."""
-
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.call_count = 0
-        outer = self
-
-        class _Messages:
-            def create(self, **kwargs: Any) -> _Msg:
-                outer.call_count += 1
-                return _Msg(payload)
-
-        self.messages = _Messages()
-
-
 def _config() -> LlmConfig:
-    return LlmConfig(model="claude-sonnet-5", temperature=1.0, max_tokens=1024, n_samples=1)
+    return LlmConfig(model=FAKE_MODEL_LABEL, temperature=0.2, max_tokens=1024, n_samples=1)
 
 
 class TestRunWeeklyReview:
     def test_no_change_response_persists_nothing(self, conn: sqlite3.Connection) -> None:
-        fake = _FakeAnthropic(
-            {
-                "schema_version": 1,
-                "no_change": True,
-                "rationale": "十分な件数がなく判断材料が乏しい",
-            }
+        fake = FakeBackend(
+            [
+                {
+                    "schema_version": 1,
+                    "no_change": True,
+                    "rationale": "十分な件数がなく判断材料が乏しい",
+                }
+            ],
+            repeat_last=True,
         )
 
         result = run_weekly_review(
@@ -86,14 +69,17 @@ class TestRunWeeklyReview:
     def test_change_proposal_persists_draft_criteria_and_audit_event(
         self, conn: sqlite3.Connection
     ) -> None:
-        fake = _FakeAnthropic(
-            {
-                "schema_version": 1,
-                "no_change": False,
-                "new_criteria": "TP幅3.5%, SL幅2%",
-                "diff": "SL幅を1.5%から2%へ拡大",
-                "rationale": "直近1週間の勝率が低く損切りが浅すぎる",
-            }
+        fake = FakeBackend(
+            [
+                {
+                    "schema_version": 1,
+                    "no_change": False,
+                    "new_criteria": "TP幅3.5%, SL幅2%",
+                    "diff": "SL幅を1.5%から2%へ拡大",
+                    "rationale": "直近1週間の勝率が低く損切りが浅すぎる",
+                }
+            ],
+            repeat_last=True,
         )
 
         result = run_weekly_review(
@@ -120,7 +106,7 @@ class TestRunWeeklyReview:
         self, conn: sqlite3.Connection
     ) -> None:
         # Missing required `rationale` -> pydantic validation fails on both attempts.
-        fake = _FakeAnthropic({"schema_version": 1, "no_change": True})
+        fake = FakeBackend([{"schema_version": 1, "no_change": True}], repeat_last=True)
 
         result = run_weekly_review(
             conn,

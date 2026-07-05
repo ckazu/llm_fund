@@ -1,8 +1,12 @@
-"""anthropic SDK ラッパと自己一致性ゲート（technical-spec.md 5章）。
+"""LLM バックエンドラッパと自己一致性ゲート（technical-spec.md 5章）。
 
-構造化出力は tool use（`tool_choice` でツールを強制）で担保する。API 呼び出しは tenacity で
-1回リトライし、スキーマ検証に失敗したら1回だけ修正リトライ、それでも失敗した場合はその
-サンプルを None（＝現状維持相当）として扱う（technical-spec.md 5章のフォールバック契約）。
+LLM 呼び出しは `llm.backend.LlmBackend` Protocol 越しに行い、特定 SDK には依存しない
+（バックエンドは claude CLI / OpenAI 互換ローカルサーバを config で切替可能）。
+構造化出力は tool use が使えないため、システムプロンプトに JSON スキーマを明示して
+「JSON のみを出力せよ」と指示し、応答から JSON を抽出（```json フェンス対応）した上で
+pydantic 検証する。呼び出しは tenacity で1回リトライし、スキーマ検証に失敗したら1回だけ
+修正リトライ、それでも失敗した場合はそのサンプルを None（＝現状維持相当）として扱う
+（technical-spec.md 5章のフォールバック契約）。
 
 自己一致性ゲート（`gather_consistent_judgment`）は同一入力で n_samples 回判断させ、
 銘柄ごとに全サンプル全会一致でない指示を破棄する（保守側）。不一致率を算出し、破棄は
@@ -17,9 +21,8 @@ import せず、狭い書き込み口 Protocol（`LlmCallSink` / `AuditSink`）�
 import json
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Protocol
+from typing import Protocol
 
-import anthropic
 from pydantic import ValidationError
 from tenacity import (
     retry,
@@ -30,12 +33,12 @@ from tenacity import (
 
 from llm_fund.domain.models import JudgmentResult, OrderPlan
 from llm_fund.judgment.schemas import (
-    JUDGMENT_TOOL_DESCRIPTION,
-    JUDGMENT_TOOL_NAME,
     SCHEMA_VERSION,
     LlmJudgment,
-    judgment_tool_schema,
+    judgment_json_schema,
 )
+from llm_fund.llm.backend import LlmBackend, LlmBackendError, LlmResponse
+from llm_fund.llm.structured import extract_json, json_output_instruction
 
 # llm_calls.kind の値（呼び出し種別。週次/月次で別値を使う想定）。
 LLM_CALL_KIND_DAILY = "daily_judgment"
@@ -43,15 +46,15 @@ LLM_CALL_KIND_DAILY = "daily_judgment"
 # audit_events.kind: 自己一致性ゲートで破棄した銘柄の記録。
 AUDIT_KIND_DISAGREEMENT = "judgment_disagreement"
 
-# 既定値（config/default.yaml の judgment セクションで上書き可能）。
+# 既定値（config/default.yaml の llm.judgment セクションで上書き可能）。
 DEFAULT_N_SAMPLES = 3
 DEFAULT_MAX_TOKENS = 4096
-# 1.0 は anthropic API の既定 temperature。Sonnet 5 等は非既定の temperature を 400 で拒否する
-# ため、既定値を使うことで tool_choice 強制と両立させつつサンプル間の自然な揺らぎを得る。
-DEFAULT_TEMPERATURE = 1.0
+# サンプル間の自然な揺らぎを保ちつつ判断を安定させる保守的な既定値。
+# claude CLI バックエンドは temperature を無視する（llm/claude_cli.py 参照）。
+DEFAULT_TEMPERATURE = 0.2
 
-# API リトライ回数（合計試行回数）。1回リトライ = 2回試行（technical-spec.md 5章）。
-_API_MAX_ATTEMPTS = 2
+# バックエンドのリトライ回数（合計試行回数）。1回リトライ = 2回試行（technical-spec.md 5章）。
+_BACKEND_MAX_ATTEMPTS = 2
 
 # 全サンプル失敗時 / 全銘柄破棄時 / 全サンプル現状維持時の NO_TRADE 理由。
 NO_TRADE_ALL_SAMPLES_FAILED = "全サンプルの LLM 応答がスキーマ検証に失敗したため NO_TRADE"
@@ -59,9 +62,9 @@ NO_TRADE_NO_CONSENSUS = "全銘柄で判断が割れた（全会一致に至ら�
 NO_TRADE_ALL_ABSTAIN = "全サンプルが現状維持（指示なし）だったため NO_TRADE"
 
 _CORRECTION_INSTRUCTION = (
-    "直前の応答は submit_judgment ツールのスキーマ検証に失敗しました。"
+    "直前の応答は投資判断 JSON のスキーマ検証に失敗しました。"
     "エラー: {error}\n"
-    "スキーマに厳密に従い、submit_judgment ツールで再度提出してください。"
+    "システムプロンプトの JSON スキーマに厳密に従い、JSON のみを再度出力してください。"
 )
 
 
@@ -94,7 +97,12 @@ class AuditSink(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class LlmConfig:
-    """LLM 呼び出しの評価プロトコル（llm_calls に記録される固定パラメータ）。"""
+    """LLM 呼び出しの評価プロトコル（llm_calls に記録される固定パラメータ）。
+
+    `model` は "backend:model" 形式のラベル（例 "claude_cli:sonnet"。
+    `llm.router.LlmRouter.label_for` が生成）。実際のバックエンド/モデル解決は
+    router が行い、この値は llm_calls の期間分離キーとしてのみ使う。
+    """
 
     model: str
     temperature: float = DEFAULT_TEMPERATURE
@@ -114,62 +122,31 @@ class ConsistencyDecision:
 
 
 @retry(
-    retry=retry_if_exception_type(anthropic.APIError),
-    stop=stop_after_attempt(_API_MAX_ATTEMPTS),
+    retry=retry_if_exception_type(LlmBackendError),
+    stop=stop_after_attempt(_BACKEND_MAX_ATTEMPTS),
     wait=wait_exponential(multiplier=1, max=10),
     reraise=True,
 )
-def _create_message(
-    client: Any, config: LlmConfig, system: str, messages: list[dict[str, Any]]
-) -> Any:
-    """anthropic messages.create を tool 強制で呼ぶ（tenacity で API エラーを1回リトライ）。
-
-    tool_choice でツールを強制するため thinking は無効化する（強制ツール選択と拡張思考は併用不可）。
-    """
-    return client.messages.create(
-        model=config.model,
-        max_tokens=config.max_tokens,
-        temperature=config.temperature,
-        thinking={"type": "disabled"},
-        system=system,
-        messages=messages,
-        tools=[
-            {
-                "name": JUDGMENT_TOOL_NAME,
-                "description": JUDGMENT_TOOL_DESCRIPTION,
-                "input_schema": judgment_tool_schema(),
-            }
-        ],
-        tool_choice={"type": "tool", "name": JUDGMENT_TOOL_NAME},
+def _complete(
+    backend: LlmBackend, config: LlmConfig, system: str, prompt: str
+) -> LlmResponse:
+    """バックエンド補完を1回呼ぶ（tenacity でバックエンド障害を1回リトライ）。"""
+    return backend.complete(
+        system, prompt, max_tokens=config.max_tokens, temperature=config.temperature
     )
 
 
-def _extract_tool_input(message: Any) -> dict[str, Any] | None:
-    """応答から最初の tool_use ブロックの input（dict）を取り出す。無ければ None。"""
-    for block in getattr(message, "content", []):
-        if getattr(block, "type", None) == "tool_use":
-            return dict(block.input)
-    return None
-
-
-def _usage_json(message: Any) -> str | None:
-    usage = getattr(message, "usage", None)
-    if usage is None:
+def _usage_json(response: LlmResponse) -> str | None:
+    if not response.usage:
         return None
-    return json.dumps(
-        {
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-        },
-        ensure_ascii=False,
-    )
+    return json.dumps(response.usage, ensure_ascii=False)
 
 
 def _call_and_parse(
-    client: Any,
+    backend: LlmBackend,
     config: LlmConfig,
     system: str,
-    messages: list[dict[str, Any]],
+    prompt: str,
     *,
     sample_index: int,
     prompt_version: str,
@@ -177,11 +154,14 @@ def _call_and_parse(
     llm_call_sink: LlmCallSink,
     kind: str,
 ) -> tuple[LlmJudgment | None, str | None]:
-    """1回の物理 API 呼び出し + 検証。(判断, エラー文字列) を返し、llm_calls へ1行記録する。"""
-    prompt_dump = json.dumps(messages, ensure_ascii=False)
+    """1回の論理呼び出し + 検証。(判断, エラー文字列) を返し、llm_calls へ1行記録する。
+
+    システムプロンプトには JSON スキーマ明示の出力指示を追記する（tool use の代替）。
+    """
+    full_system = f"{system}\n\n{json_output_instruction(judgment_json_schema())}"
     try:
-        message = _create_message(client, config, system, messages)
-    except anthropic.APIError as exc:
+        response = _complete(backend, config, full_system, prompt)
+    except LlmBackendError as exc:
         llm_call_sink.add(
             kind=kind,
             model=config.model,
@@ -189,17 +169,13 @@ def _call_and_parse(
             prompt_version=prompt_version,
             schema_version=SCHEMA_VERSION,
             sample_index=sample_index,
-            prompt=prompt_dump,
-            response=f"API_ERROR: {exc}",
+            prompt=prompt,
+            response=f"BACKEND_ERROR: {exc}",
             token_usage_json=None,
             briefing_id=briefing_id,
         )
-        return None, f"api_error: {exc}"
+        return None, f"backend_error: {exc}"
 
-    raw = _extract_tool_input(message)
-    response_text = (
-        json.dumps(raw, ensure_ascii=False) if raw is not None else "（tool_use ブロックなし）"
-    )
     llm_call_sink.add(
         kind=kind,
         model=config.model,
@@ -207,13 +183,15 @@ def _call_and_parse(
         prompt_version=prompt_version,
         schema_version=SCHEMA_VERSION,
         sample_index=sample_index,
-        prompt=prompt_dump,
-        response=response_text,
-        token_usage_json=_usage_json(message),
+        prompt=prompt,
+        response=response.text,
+        token_usage_json=_usage_json(response),
         briefing_id=briefing_id,
     )
-    if raw is None:
-        return None, "no tool_use block in response"
+    try:
+        raw = extract_json(response.text)
+    except ValueError as exc:
+        return None, str(exc)
     try:
         return LlmJudgment.model_validate(raw), None
     except ValidationError as exc:
@@ -221,7 +199,7 @@ def _call_and_parse(
 
 
 def request_judgment(
-    client: Any,
+    backend: LlmBackend,
     config: LlmConfig,
     *,
     system: str,
@@ -234,12 +212,11 @@ def request_judgment(
     kind: str = LLM_CALL_KIND_DAILY,
 ) -> JudgmentResult | None:
     """1サンプル分の判断を取得する。スキーマ検証失敗時は1回だけ修正リトライし、再失敗なら None。"""
-    messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
     judgment, error = _call_and_parse(
-        client,
+        backend,
         config,
         system,
-        messages,
+        user_prompt,
         sample_index=sample_index,
         prompt_version=prompt_version,
         briefing_id=briefing_id,
@@ -249,15 +226,14 @@ def request_judgment(
     if judgment is not None:
         return judgment.to_judgment_result(as_of)
 
-    correction: list[dict[str, Any]] = [
-        {"role": "user", "content": user_prompt},
-        {"role": "user", "content": _CORRECTION_INSTRUCTION.format(error=error)},
-    ]
+    correction_prompt = (
+        f"{user_prompt}\n\n{_CORRECTION_INSTRUCTION.format(error=error)}"
+    )
     judgment, _ = _call_and_parse(
-        client,
+        backend,
         config,
         system,
-        correction,
+        correction_prompt,
         sample_index=sample_index,
         prompt_version=prompt_version,
         briefing_id=briefing_id,
@@ -272,7 +248,7 @@ def _order_for(result: JudgmentResult, symbol: str) -> OrderPlan | None:
 
 
 def gather_consistent_judgment(
-    client: Any,
+    backend: LlmBackend,
     config: LlmConfig,
     *,
     system: str,
@@ -287,7 +263,7 @@ def gather_consistent_judgment(
     """n_samples 回判断させ、全会一致でない銘柄を破棄した合意判断を返す（自己一致性ゲート）。"""
     results = [
         request_judgment(
-            client,
+            backend,
             config,
             system=system,
             user_prompt=user_prompt,

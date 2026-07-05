@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "LLM がファンドマネージャー役として売買指示を生成し、人間が執行する投資判断 CLI"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=0.40",
     "pandas>=2.2",
     "yfinance>=0.2.50",
     "pydantic>=2.9",

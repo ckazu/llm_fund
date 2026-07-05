@@ -23,11 +23,23 @@ LLM に発注・DB書込み・通知の権限を構造的に持たせていな�
 
 ```bash
 uv sync
-cp .env.example .env   # なければ新規作成: ANTHROPIC_API_KEY, NOTIFY_WEBHOOK_URL(任意) を設定
+cp .env.example .env   # なければ新規作成: NOTIFY_WEBHOOK_URL(任意)、LOCAL_LLM_API_KEY(任意) を設定
 ```
 
 `config/default.yaml` と `config/universes.yaml` を環境に合わせて用意する（キー詳細は
 [docs/technical-spec.md](docs/technical-spec.md) 9章）。
+
+### LLM バックエンド
+
+課金 API（anthropic SDK）は使わず、設定でバックエンドを切り替えられる:
+
+- **claude_cli**: Claude Code CLI（`claude -p`）をサブプロセス実行（サブスクリプション認証）。
+  `claude` コマンドがインストール・ログイン済みであること
+- **OpenAI 互換ローカルサーバ**: mlx_lm.server / Ollama / LM Studio 等の
+  `/v1/chat/completions` を呼ぶ（`base_url` を設定。認証が必要なら `.env` の `LOCAL_LLM_API_KEY`）
+
+`config/default.yaml` の `llm.roles` で用途（日次判断 `judgment` / 週次 `weekly_review` /
+月次 `monthly_review`）ごとにバックエンドとモデルを使い分けられる。
 
 ## コマンド一覧
 
@@ -56,7 +68,7 @@ cp .env.example .env   # なければ新規作成: ANTHROPIC_API_KEY, NOTIFY_WEB
 ## 開発
 
 ```bash
-uv run pytest          # テスト（外部API=yfinance/anthropic/webhookは全モック）
+uv run pytest          # テスト（外部依存=yfinance/LLMバックエンド/webhookは全モック）
 uv run ruff check src tests
 uv run mypy src
 ```

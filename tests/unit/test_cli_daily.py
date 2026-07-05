@@ -1,7 +1,8 @@
 """End-to-end tests for `fund daily` (technical-spec.md 8, 10章).
 
-Covers the `--no-llm` template smoke path and the LLM judgment path with anthropic
-fully mocked, against a temporary DB. Verifies the trade line renders instructions /
+Covers the `--no-llm` template smoke path and the LLM judgment path with the
+backend fully mocked (`FakeBackend` + a patched router; no subprocess / HTTP),
+against a temporary DB. Verifies the trade line renders instructions /
 rejections / disagreement rate and that instructions + llm_calls are persisted.
 """
 
@@ -23,6 +24,8 @@ from llm_fund.store.repos import (
     PortfolioStateRepo,
     PositionRepo,
 )
+from tests.factories import build_llm_config_dict
+from tests.fakes import FAKE_MODEL_LABEL, FakeBackend, FakeRouter
 
 runner = CliRunner()
 TODAY = date.today()
@@ -53,13 +56,13 @@ class _StubSource:
         ]
 
 
-def _write_config(tmp_path: Path, db_path: str) -> None:
+def _write_config(tmp_path: Path, db_path: str, *, claude_command: str = "claude") -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "default.yaml").write_text(
         yaml.safe_dump(
             {
-                "llm": {"model": "claude-sonnet-5"},
+                "llm": build_llm_config_dict(command=claude_command),
                 "limits": {
                     "max_position_pct": 15.0,
                     "max_turnover_pct": 30.0,
@@ -68,7 +71,6 @@ def _write_config(tmp_path: Path, db_path: str) -> None:
                 },
                 "benchmark": {"index_symbol": "1306.T", "momentum_lookback_days": 120},
                 "report": {"output_dir": "reports"},
-                "judgment": {"n_samples": 3},
                 "db_path": db_path,
             }
         ),
@@ -110,28 +112,16 @@ def _daily_content(project: Path) -> str:
     return (project / "reports" / f"{TODAY.isoformat()}-daily.md").read_text(encoding="utf-8")
 
 
-# --- fake anthropic (LLM path) ----------------------------------------------
+# --- fake LLM backend (LLM path) ----------------------------------------------
 
 
-class _Msg:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.content = [type("B", (), {"type": "tool_use", "input": payload})()]
-        self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 5})()
-
-
-class _FakeAnthropic:
-    """Always returns the same valid judgment; records every create() call."""
-
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.call_count = 0
-        outer = self
-
-        class _Messages:
-            def create(self, **kwargs: Any) -> _Msg:
-                outer.call_count += 1
-                return _Msg(payload)
-
-        self.messages = _Messages()
+def _patch_backend(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]
+) -> FakeBackend:
+    """Route every role to a FakeBackend that always returns `payload`."""
+    fake = FakeBackend([payload], repeat_last=True)
+    monkeypatch.setattr("llm_fund.cli.build_router", lambda settings: FakeRouter(fake))
+    return fake
 
 
 def _order_payload(
@@ -204,10 +194,25 @@ class TestDailyNoLlm:
 
 
 class TestDailyLlm:
-    def test_missing_api_key_exits_config_error(
+    def test_missing_claude_command_exits_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # claude コマンド不在はバックエンド解決失敗＝設定異常（exit 3）として扱う。
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path, "test.db", claude_command="no-such-claude-cmd")
+        monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
+
+        result = runner.invoke(app, ["daily"])
+
+        assert result.exit_code == 3
+
+    def test_undefined_judgment_role_exits_config_error(
         self, project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        config_path = project / "config" / "default.yaml"
+        conf = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        del conf["llm"]["roles"]["judgment"]
+        config_path.write_text(yaml.safe_dump(conf), encoding="utf-8")
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
 
         result = runner.invoke(app, ["daily"])
@@ -217,10 +222,8 @@ class TestDailyLlm:
     def test_llm_path_validates_and_persists_instruction(
         self, project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
-        fake = _FakeAnthropic(_valid_payload())
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+        fake = _patch_backend(monkeypatch, _valid_payload())
 
         # Seed portfolio state so the BUY has cash/NAV to validate against.
         conn = init_db(str(project / "test.db"))
@@ -239,7 +242,10 @@ class TestDailyLlm:
         ticket = f"{TODAY.strftime('%Y%m%d')}-01"
         assert InstructionRepo(conn2).get_by_ticket_no(ticket) is not None
         assert fake.call_count == 3
-        assert len(LlmCallRepo(conn2).list_all()) == 3
+        calls = LlmCallRepo(conn2).list_all()
+        assert len(calls) == 3
+        # llm_calls.model には "backend:model" ラベルを記録する。
+        assert all(call.model == FAKE_MODEL_LABEL for call in calls)
 
     def test_llm_first_day_buy_validates_against_starting_capital(
         self, project: Path, monkeypatch: pytest.MonkeyPatch
@@ -247,10 +253,8 @@ class TestDailyLlm:
         # On the first daily run portfolio_state is unseeded; the gate must fall back to
         # the configured starting_capital instead of nav=cash=0 (which would reject
         # every BUY and silently discard the first day's judgment).
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
-        fake = _FakeAnthropic(_valid_payload())
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+        _patch_backend(monkeypatch, _valid_payload())
 
         result = runner.invoke(app, ["daily"])
 
@@ -266,10 +270,8 @@ class TestDailyLlm:
     ) -> None:
         # A SELL/CLOSE must be able to validate once a position exists: the gate has to
         # read held units from `positions`, else ExitWithinHolding rejects every exit.
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
-        fake = _FakeAnthropic(_payload(_order_payload(action="SELL", units=100)))
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+        _patch_backend(monkeypatch, _payload(_order_payload(action="SELL", units=100)))
 
         _seed_open_position(str(project / "test.db"), units=200)
 
@@ -290,10 +292,8 @@ class TestDailyLlm:
         # A prior-day holding must count toward MaxPositionPct: a fresh 500-unit BUY that
         # would pass in isolation (~5.5% of NAV) is rejected because 1000 held units are
         # folded in ((1000+500)*110 = 165,000 > NAV*15% = 150,000).
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr("llm_fund.cli.YFinanceSource", lambda: _StubSource(TODAY))
-        fake = _FakeAnthropic(_payload(_order_payload(action="BUY", units=500)))
-        monkeypatch.setattr("llm_fund.cli.anthropic.Anthropic", lambda **kwargs: fake)
+        _patch_backend(monkeypatch, _payload(_order_payload(action="BUY", units=500)))
 
         _seed_open_position(str(project / "test.db"), units=1000)
 

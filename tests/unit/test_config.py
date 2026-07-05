@@ -6,9 +6,10 @@ import pytest
 import yaml
 
 from llm_fund.config import ConfigError, load_settings
+from tests.factories import build_llm_config_dict
 
 VALID_DEFAULT = {
-    "llm": {"model": "claude-sonnet-5", "ratio_only": True},
+    "llm": build_llm_config_dict(),
     "limits": {
         "max_position_pct": 15.0,
         "max_turnover_pct": 30.0,
@@ -54,7 +55,10 @@ class TestLoadSettings:
     def test_loads_valid_config(self, config_dir: Path, missing_env: Path) -> None:
         settings = load_settings(config_dir=config_dir, env_file=missing_env)
 
-        assert settings.llm.model == "claude-sonnet-5"
+        assert settings.llm.roles["judgment"].backend == "claude_cli"
+        assert settings.llm.roles["judgment"].model == "sonnet"
+        assert settings.llm.backends["claude_cli"].command == "claude"
+        assert settings.llm.judgment.n_samples == 3
         assert settings.limits.max_position_pct == 15.0
         assert settings.benchmark.index_symbol == "1306.T"
         assert "jp_stocks" in settings.universes
@@ -62,11 +66,41 @@ class TestLoadSettings:
 
     def test_env_secrets_loaded_from_env_file(self, config_dir: Path, tmp_path: Path) -> None:
         env_file = tmp_path / ".env"
-        env_file.write_text("ANTHROPIC_API_KEY=sk-test\n", encoding="utf-8")
+        env_file.write_text("LOCAL_LLM_API_KEY=sk-local-test\n", encoding="utf-8")
 
         settings = load_settings(config_dir=config_dir, env_file=env_file)
 
-        assert settings.anthropic_api_key == "sk-test"
+        assert settings.local_llm_api_key == "sk-local-test"
+
+    def test_role_referencing_undefined_backend_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad_llm = build_llm_config_dict()
+        bad_llm["roles"]["judgment"] = {"backend": "nonexistent", "model": "sonnet"}
+        _write_yaml(config_dir / "default.yaml", {**VALID_DEFAULT, "llm": bad_llm})
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_backend_with_command_and_base_url_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad_llm = build_llm_config_dict()
+        bad_llm["backends"]["claude_cli"]["base_url"] = "http://127.0.0.1:8080/v1"
+        _write_yaml(config_dir / "default.yaml", {**VALID_DEFAULT, "llm": bad_llm})
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_backend_without_command_or_base_url_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad_llm = build_llm_config_dict()
+        bad_llm["backends"]["claude_cli"] = {"timeout_seconds": 300}
+        _write_yaml(config_dir / "default.yaml", {**VALID_DEFAULT, "llm": bad_llm})
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
 
     def test_max_position_pct_over_absolute_cap_is_rejected(
         self, config_dir: Path, missing_env: Path

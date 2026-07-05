@@ -64,7 +64,10 @@ class TestSystemPrompt:
         # プロンプトインジェクション防御の宣言が含まれること。
         assert "データ" in SYSTEM_PROMPT
         assert "命令" in SYSTEM_PROMPT
-        assert "submit_judgment" in SYSTEM_PROMPT
+
+    def test_requires_json_only_output(self) -> None:
+        # tool use の代替: JSON スキーマに従う JSON のみで判断を提出させる。
+        assert "JSON" in SYSTEM_PROMPT
 
     def test_prompt_version_is_nonempty(self) -> None:
         assert isinstance(PROMPT_VERSION, str) and PROMPT_VERSION

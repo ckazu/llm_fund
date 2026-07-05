@@ -27,13 +27,6 @@ from llm_fund.domain.models import JudgmentResult, OrderPlan
 # （不一致は破壊的変更の可能性 → スキーマ検証失敗として扱う）。
 SCHEMA_VERSION = 1
 
-# tool use による構造化出力強制で使うツール名（judgment/client.py が tool_choice で指定）。
-JUDGMENT_TOOL_NAME = "submit_judgment"
-JUDGMENT_TOOL_DESCRIPTION = (
-    "検証済みの投資判断（市況要約・売買指示リスト・NO_TRADE 判定）を構造化して提出する。"
-    "このツール以外の方法で判断を返してはならない。"
-)
-
 # ワイヤ段階での lot 一次チェックに使う東証標準の売買単位。銘柄別の実 lot は
 # validator 層が instruments.lot_size で厳密に再検証する。
 DEFAULT_LOT_SIZE = 100
@@ -125,11 +118,11 @@ class LlmJudgment(BaseModel):
         )
 
 
-def judgment_tool_schema() -> dict[str, Any]:
-    """`LlmJudgment` の JSON Schema を anthropic tool の input_schema として返す。
+def judgment_json_schema() -> dict[str, Any]:
+    """`LlmJudgment` の JSON Schema を返す（プロンプトに明示する出力スキーマ）。
 
-    ワイヤ形式（pydantic モデル）を唯一の真実として tool スキーマを導出し、検証側と
-    出力強制側でのスキーマのずれを防ぐ。`extra="forbid"` により
+    ワイヤ形式（pydantic モデル）を唯一の真実としてスキーマを導出し、検証側と
+    プロンプト側でのスキーマのずれを防ぐ。`extra="forbid"` により
     `additionalProperties: false` が付与され、未知フィールドは検証段階で弾かれる。
     """
     return LlmJudgment.model_json_schema()

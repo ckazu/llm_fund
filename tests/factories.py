@@ -101,6 +101,22 @@ def build_validation_context(
     )
 
 
+def build_llm_config_dict(
+    *, command: str = "claude", n_samples: int = 3
+) -> dict[str, Any]:
+    """config/default.yaml の `llm` セクション相当（新形式: roles + backends）。"""
+    return {
+        "ratio_only": True,
+        "judgment": {"n_samples": n_samples},
+        "roles": {
+            "judgment": {"backend": "claude_cli", "model": "sonnet"},
+            "weekly_review": {"backend": "claude_cli", "model": "opus"},
+            "monthly_review": {"backend": "claude_cli", "model": "opus"},
+        },
+        "backends": {"claude_cli": {"command": command, "timeout_seconds": 300}},
+    }
+
+
 def build_llm_order_payload(
     *,
     symbol: str = "7203.T",

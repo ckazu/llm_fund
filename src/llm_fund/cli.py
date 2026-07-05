@@ -4,7 +4,6 @@ import json
 import sqlite3
 from datetime import UTC, date, datetime
 
-import anthropic
 import typer
 
 from llm_fund.briefing.builder import build_universe_briefing, save_briefing
@@ -29,6 +28,15 @@ from llm_fund.judgment.client import (
     gather_consistent_judgment,
 )
 from llm_fund.judgment.template import template_judgment
+from llm_fund.llm.backend import LlmBackend
+from llm_fund.llm.claude_cli import ClaudeCliBackend
+from llm_fund.llm.router import (
+    ROLE_JUDGMENT,
+    ROLE_MONTHLY_REVIEW,
+    ROLE_WEEKLY_REVIEW,
+    LlmRouterError,
+    build_router,
+)
 from llm_fund.review.monthly import (
     AUDIT_KIND_POLICY_APPROVED,
     render_benchmark_performance_md,
@@ -302,6 +310,8 @@ def _build_validation_context(
 def _run_judgment(
     settings: AppSettings,
     conn: sqlite3.Connection,
+    backend: LlmBackend,
+    model_label: str,
     *,
     briefing_md: str,
     as_of: date,
@@ -313,12 +323,11 @@ def _run_judgment(
     `holdings` (symbol -> 時価総額) feeds the ratio-based portfolio prompt so the LLM
     sees its actual open positions (technical-spec.md 5章), not an always-empty book.
     """
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     config = LlmConfig(
-        model=settings.llm.model,
-        temperature=settings.judgment.temperature,
-        max_tokens=settings.judgment.max_tokens,
-        n_samples=settings.judgment.n_samples,
+        model=model_label,
+        temperature=settings.llm.judgment.temperature,
+        max_tokens=settings.llm.judgment.max_tokens,
+        n_samples=settings.llm.judgment.n_samples,
     )
     nav, cash = _portfolio_nav_cash(settings, conn)
     user_prompt = prompts.build_user_prompt(
@@ -326,7 +335,7 @@ def _run_judgment(
         portfolio_summary=prompts.format_portfolio_ratio(nav, cash, holdings),
     )
     decision = gather_consistent_judgment(
-        client,
+        backend,
         config,
         system=prompts.SYSTEM_PROMPT,
         user_prompt=user_prompt,
@@ -346,6 +355,7 @@ def _run_trade_line(
     as_of: date,
     *,
     no_llm: bool,
+    llm_route: tuple[LlmBackend, str] | None,
     briefing_id: int,
     briefing_md: str,
     candles_by_symbol: dict[str, list[Candle]],
@@ -361,15 +371,18 @@ def _run_trade_line(
     current_exposure = sum(market_value.values())
 
     disagreement: float | None = None
-    if no_llm:
+    if no_llm or llm_route is None:
         judgment: JudgmentResult | None = template_judgment()
     elif not data_fresh:
-        # 鮮度違反時は課金前に LLM をスキップし、ゲートに NO_TRADE を強制させる。
+        # 鮮度違反時は LLM 呼び出し前にスキップし、ゲートに NO_TRADE を強制させる。
         judgment = None
     else:
+        backend, model_label = llm_route
         judgment, disagreement = _run_judgment(
             settings,
             conn,
+            backend,
+            model_label,
             briefing_md=briefing_md,
             as_of=as_of,
             briefing_id=briefing_id,
@@ -441,6 +454,7 @@ def _render_trade_line(
     as_of: date,
     *,
     no_llm: bool,
+    llm_route: tuple[LlmBackend, str] | None,
     briefing_ids: dict[str, int],
     candles_by_code: dict[str, dict[str, list[Candle]]],
 ) -> tuple[str, dict[str, GateDecision]]:
@@ -470,6 +484,7 @@ def _render_trade_line(
             code,
             as_of,
             no_llm=no_llm,
+            llm_route=llm_route,
             briefing_id=briefing_id,
             briefing_md=briefing_md,
             candles_by_symbol=candles_by_symbol,
@@ -492,7 +507,8 @@ def daily(
     """Report all report universes, then judge -> validate -> record for trade universes.
 
     Aborts with exit code 2 if any report universe's data is stale, or 3 if config is
-    invalid (or the LLM path is requested without an API key). NO_TRADE is exit 0.
+    invalid (or the LLM backend for the judgment role cannot be resolved). NO_TRADE is
+    exit 0.
     """
     try:
         settings = load_settings()
@@ -503,12 +519,9 @@ def daily(
     report_codes = [code for code, conf in settings.universes.items() if conf.report]
     trade_codes = [code for code, conf in settings.universes.items() if conf.trade]
 
-    if not no_llm and trade_codes and settings.anthropic_api_key is None:
-        typer.echo(
-            "[daily] ANTHROPIC_API_KEY 未設定。--no-llm を使うか .env に設定してください。",
-            err=True,
-        )
-        raise typer.Exit(code=3)
+    llm_route: tuple[LlmBackend, str] | None = None
+    if not no_llm and trade_codes:
+        llm_route = _resolve_llm_route(settings, "daily", ROLE_JUDGMENT)
 
     as_of = _resolve_as_of(date)
     conn = init_db(settings.db_path)
@@ -531,6 +544,7 @@ def daily(
         trade_codes,
         as_of,
         no_llm=no_llm,
+        llm_route=llm_route,
         briefing_ids=briefing_ids,
         candles_by_code=candles_by_code,
     )
@@ -552,22 +566,37 @@ def daily(
         )
 
 
-def _require_llm_settings(settings: AppSettings, command: str) -> anthropic.Anthropic:
-    """Abort with exit code 3 if no API key is configured, else return an anthropic client."""
-    if settings.anthropic_api_key is None:
+def _resolve_llm_route(
+    settings: AppSettings, command: str, role: str
+) -> tuple[LlmBackend, str]:
+    """Resolve `role` to `(backend, "backend:model" label)`, aborting with exit code 3.
+
+    バックエンド解決失敗（未定義 role / 未定義 backend）と claude コマンド不在は
+    どちらも設定異常（exit 3）として扱う（technical-spec.md 8章の終了コード契約）。
+    """
+    try:
+        router = build_router(settings)
+        backend, _ = router.for_role(role)
+        label = router.label_for(role)
+    except LlmRouterError as exc:
+        typer.echo(f"[{command}] LLM バックエンド設定エラー: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+    if isinstance(backend, ClaudeCliBackend) and not backend.is_available():
         typer.echo(
-            f"[{command}] ANTHROPIC_API_KEY 未設定。.env に設定してください。", err=True
+            f"[{command}] claude コマンド（{backend.command}）が見つかりません。"
+            "Claude Code CLI をインストールするか、llm.backends の設定を見直してください。",
+            err=True,
         )
         raise typer.Exit(code=3)
-    return anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    return backend, label
 
 
-def _review_llm_config(settings: AppSettings) -> LlmConfig:
+def _review_llm_config(settings: AppSettings, model_label: str) -> LlmConfig:
     """`weekly`/`monthly` は自己一致性チェックを行わない単発呼び出し（n_samples=1）。"""
     return LlmConfig(
-        model=settings.llm.model,
-        temperature=settings.judgment.temperature,
-        max_tokens=settings.judgment.max_tokens,
+        model=model_label,
+        temperature=settings.llm.judgment.temperature,
+        max_tokens=settings.llm.judgment.max_tokens,
         n_samples=1,
     )
 
@@ -591,14 +620,14 @@ def weekly(
         typer.echo(f"[weekly] config error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
 
-    client = _require_llm_settings(settings, "weekly")
+    backend, model_label = _resolve_llm_route(settings, "weekly", ROLE_WEEKLY_REVIEW)
     as_of = _resolve_as_of(date)
     conn = init_db(settings.db_path)
 
     result = run_weekly_review(
         conn,
-        client,
-        _review_llm_config(settings),
+        backend,
+        _review_llm_config(settings, model_label),
         as_of=as_of,
         prompt_version=WEEKLY_PROMPT_VERSION,
         llm_call_sink=LlmCallRepo(conn),
@@ -636,7 +665,7 @@ def monthly(
         typer.echo(f"[monthly] config error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
 
-    client = _require_llm_settings(settings, "monthly")
+    backend, model_label = _resolve_llm_route(settings, "monthly", ROLE_MONTHLY_REVIEW)
     as_of = _resolve_as_of(date)
     conn = init_db(settings.db_path)
 
@@ -644,8 +673,8 @@ def monthly(
     performance_md = render_benchmark_performance_md(summary)
     result = run_monthly_review(
         conn,
-        client,
-        _review_llm_config(settings),
+        backend,
+        _review_llm_config(settings, model_label),
         as_of=as_of,
         prompt_version=MONTHLY_PROMPT_VERSION,
         performance_summary=performance_md,

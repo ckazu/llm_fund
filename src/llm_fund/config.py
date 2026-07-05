@@ -28,6 +28,8 @@ from llm_fund.validator.rules import (
 DEFAULT_CONFIG_DIR = Path("config")
 DEFAULT_ENV_FILE = Path(".env")
 DEFAULT_DB_PATH = "llm_fund.db"
+# LLM バックエンド呼び出しの既定タイムアウト（config/default.yaml で上書き可能）。
+DEFAULT_LLM_TIMEOUT_SECONDS = 300
 # 営業日カレンダーを持たないための近似既定値。data/loader.py の既定と合わせる。
 DEFAULT_MAX_STALENESS_DAYS = 4
 
@@ -46,11 +48,6 @@ class ConfigError(Exception):
     """Raised when configuration is missing/invalid or exceeds absolute limits."""
 
 
-class LLMSettings(BaseModel):
-    model: str
-    ratio_only: bool = True
-
-
 class JudgmentSettings(BaseModel):
     """自己一致性・LLM 呼び出しパラメータ（technical-spec.md 5章。任意。既定で 3 サンプル）。"""
 
@@ -61,9 +58,61 @@ class JudgmentSettings(BaseModel):
     @model_validator(mode="after")
     def _check_positive(self) -> "JudgmentSettings":
         if self.n_samples < 1:
-            raise ConfigError(f"judgment.n_samples={self.n_samples} must be >= 1")
+            raise ConfigError(f"llm.judgment.n_samples={self.n_samples} must be >= 1")
         if self.max_tokens < 1:
-            raise ConfigError(f"judgment.max_tokens={self.max_tokens} must be >= 1")
+            raise ConfigError(f"llm.judgment.max_tokens={self.max_tokens} must be >= 1")
+        return self
+
+
+class LlmRoleSettings(BaseModel):
+    """1 role（judgment / weekly_review / monthly_review 等）のバックエンド割当。"""
+
+    backend: str
+    model: str
+
+
+class LlmBackendSettings(BaseModel):
+    """1バックエンドの接続設定。
+
+    種別は接続設定から推定する: `base_url` があれば OpenAI 互換 HTTP サーバ
+    （mlx_lm.server / Ollama / LM Studio 等）、`command` があれば claude CLI。
+    両方の指定・どちらも未指定は設定エラー。
+    """
+
+    command: str | None = None
+    base_url: str | None = None
+    timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
+
+    @model_validator(mode="after")
+    def _check_exactly_one_kind(self) -> "LlmBackendSettings":
+        if (self.command is None) == (self.base_url is None):
+            raise ConfigError(
+                "llm.backends の各エントリは command（claude CLI）または "
+                "base_url（OpenAI 互換サーバ）のどちらか一方のみを指定する"
+            )
+        if self.timeout_seconds < 1:
+            raise ConfigError(
+                f"llm.backends.timeout_seconds={self.timeout_seconds} must be >= 1"
+            )
+        return self
+
+
+class LLMSettings(BaseModel):
+    """LLM 層の設定: プラガブルなバックエンド定義と role 別ルーティング。"""
+
+    ratio_only: bool = True
+    judgment: JudgmentSettings = Field(default_factory=JudgmentSettings)
+    roles: dict[str, LlmRoleSettings]
+    backends: dict[str, LlmBackendSettings]
+
+    @model_validator(mode="after")
+    def _check_role_backends_defined(self) -> "LLMSettings":
+        for role, conf in self.roles.items():
+            if conf.backend not in self.backends:
+                raise ConfigError(
+                    f"llm.roles.{role} が未定義の backend {conf.backend!r} を参照している"
+                    f"（定義済み: {sorted(self.backends)}）"
+                )
         return self
 
 
@@ -160,13 +209,14 @@ class UniverseConfig(BaseModel):
 class AppSettings(BaseSettings):
     """Merged application configuration.
 
-    Secrets (`anthropic_api_key`, `notify_webhook_url`) come from `.env`;
+    Secrets (`local_llm_api_key`, `notify_webhook_url`) come from `.env`;
     everything else comes from `config/default.yaml` + `config/universes.yaml`.
     """
 
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
-    anthropic_api_key: str | None = None
+    # OpenAI 互換ローカルバックエンドが認証を要求する構成向け（任意）。
+    local_llm_api_key: str | None = None
     notify_webhook_url: str | None = None
     db_path: str = DEFAULT_DB_PATH
 
@@ -175,7 +225,6 @@ class AppSettings(BaseSettings):
     benchmark: BenchmarkSettings
     report: ReportSettings
     data: DataSettings = Field(default_factory=DataSettings)
-    judgment: JudgmentSettings = Field(default_factory=JudgmentSettings)
     tracking: TrackingSettings = Field(default_factory=TrackingSettings)
     universes: dict[str, UniverseConfig]
 

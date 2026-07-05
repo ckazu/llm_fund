@@ -4,8 +4,11 @@
 
 ## 1. 前提
 
-- `.env` に `ANTHROPIC_API_KEY`（LLM 判断を使う `daily`/`weekly`/`monthly` に必須）と、
-  任意で `NOTIFY_WEBHOOK_URL`（Discord/Slack 互換 Incoming Webhook URL）を設定する。
+- LLM 判断を使う `daily`/`weekly`/`monthly` には、`config/default.yaml` の `llm.backends` に
+  応じて `claude` コマンド（Claude Code CLI、ログイン済み）または OpenAI 互換ローカル LLM
+  サーバ（mlx_lm.server / Ollama / LM Studio 等）が利用可能であること。`.env` には任意で
+  `NOTIFY_WEBHOOK_URL`（Discord/Slack 互換 Incoming Webhook URL）と `LOCAL_LLM_API_KEY`
+  （ローカルサーバが認証を要求する場合）を設定する。
 - `config/default.yaml` / `config/universes.yaml` を環境に合わせて配置する。
 - 実行前に `uv sync` 済みであること。cron からは `uv run fund ...` で起動する。
 
@@ -67,8 +70,8 @@ cron のジョブランナー（cronjob 監視ツール、`||` での通知コ�
 
 ### 4.2 設定異常（終了コード3）
 
-1. `.env` の `ANTHROPIC_API_KEY` 設定漏れ、`config/default.yaml`/`config/universes.yaml` の
-   欠落・YAML構文エラーを確認する。
+1. `claude` コマンドの不在・未ログイン、`llm.roles` が参照する backend 名の定義漏れ、
+   `config/default.yaml`/`config/universes.yaml` の欠落・YAML構文エラーを確認する。
 2. `limits.*` が `validator/rules.py` の絶対上限を超えていないか確認する
    （超過時は `ConfigError` として起動時に検出される）。
 3. 修正後、該当コマンドを手動で再実行して終了コード0を確認する。

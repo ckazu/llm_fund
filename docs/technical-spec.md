@@ -10,7 +10,7 @@
 |---|---|---|
 | 言語 / パッケージ管理 | Python 3.12 / uv | llm_company と統一 |
 | CLI | typer（コマンド名 `fund`） | cron / llm_company trigger から起動 |
-| LLM | Claude API（anthropic SDK） | モデルは config で切替（既定 claude-sonnet-5） |
+| LLM | プラガブルバックエンド（claude CLI サブプロセス / OpenAI 互換ローカルサーバ） | API 課金なし。バックエンド・モデルは config で用途（role）別に切替 |
 | 価格データ | yfinance（EOD） | 非公式のためデータ層で抽象化し将来差替可能に |
 | 永続化 | SQLite | 単一プロセス・個人利用のため十分 |
 | 検証・型 | pytest / ruff / mypy(strict) | TDD、外部 API は全モック |
@@ -26,7 +26,7 @@ data/       価格取得(yfinance) + SQLiteキャッシュ + 鮮度/欠損ゲー
         ▼
 briefing/   指標計算 → LLM向け構造化テーブル生成
         ▼
-judgment/   Claude API 構造化出力（--no-llm でテンプレート判断に差替）
+judgment/   LLM 構造化出力（llm/ のバックエンド抽象経由。--no-llm でテンプレート判断に差替）
         ▼
 validator/  ハード拒否ルール + 警告付与（コンプライアンス層）
         ▼
@@ -53,9 +53,15 @@ src/llm_fund/
 ├── briefing/
 │   ├── indicators.py    # リターン, MA乖離, ATR, 出来高比
 │   └── builder.py       # LLM 向けテーブル/Markdown 生成
+├── llm/
+│   ├── backend.py       # LlmBackend Protocol / LlmResponse / LlmBackendError
+│   ├── claude_cli.py    # claude -p（Claude Code CLI）サブプロセスバックエンド
+│   ├── openai_compat.py # OpenAI 互換 HTTP サーバ（mlx_lm.server / Ollama / LM Studio）
+│   ├── structured.py    # JSON スキーマ明示指示 + JSON 抽出（```json フェンス対応）
+│   └── router.py        # role（judgment/weekly_review/monthly_review）→ backend+model 解決
 ├── judgment/
 │   ├── schemas.py       # LLM 入出力 pydantic スキーマ（schema_version 付き）
-│   ├── client.py        # anthropic ラッパ（リトライ、監査ログ記録）
+│   ├── client.py        # バックエンドラッパ（リトライ、監査ログ記録）
 │   ├── prompts.py       # 方針・基準・過去成績を注入するプロンプト組立
 │   └── template.py      # --no-llm 用テンプレート判断
 ├── validator/
@@ -143,7 +149,11 @@ audit_events(id, ts, kind, detail_json)   -- 拒否/警告/NO_TRADE/承認/ロ�
 4. 現在ポートフォリオ（**比率ベース**: 各銘柄の組入%、現金%。実額は既定で送らない）
 5. 直近 N 件の指示とその仮想成績（自己修正の材料）
 
-### 出力（tool use / structured output で強制）
+### 出力（プロンプト指示 + スキーマ検証で強制）
+
+バックエンド（claude CLI / ローカル LLM）は tool use を使えないため、システムプロンプトに
+JSON スキーマ（pydantic モデルから導出）を明示して「スキーマに従う JSON のみを出力せよ」と
+指示し、応答から JSON を抽出（```json フェンス対応）した上で pydantic 検証する。
 
 ```json
 {
@@ -246,10 +256,35 @@ ABSOLUTE_MAX_TURNOVER_PCT = 50.0
 
 ## 9. 設定
 
-- `.env`: `ANTHROPIC_API_KEY`, `NOTIFY_WEBHOOK_URL`（秘匿）
-- `config/default.yaml`: モデル名、制限値（絶対上限以下のみ有効）、ベンチマーク設定、手数料・スリッページ、出力先
+- `.env`: `LOCAL_LLM_API_KEY`（任意。OpenAI 互換バックエンドが認証を要求する場合のみ）, `NOTIFY_WEBHOOK_URL`（秘匿）
+- `config/default.yaml`: LLM バックエンド/role 別ルーティング、制限値（絶対上限以下のみ有効）、ベンチマーク設定、手数料・スリッページ、出力先
 - `config/universes.yaml`: 名前付きユニバース複数（例: `jp_stocks`(trade), `us_stocks`(report), `etf`(report)）。各ユニバースに market / report / trade / cadence と銘柄リスト（月次提案→`fund approve` で更新）
-- 起動時に設定値が絶対上限を超えていたら終了コード 3 で abort
+- 起動時に設定値が絶対上限を超えていたら終了コード 3 で abort。`llm.roles` が未定義の backend を参照している場合・`claude` コマンド不在の場合も終了コード 3
+
+### LLM バックエンド設定（`config/default.yaml` の `llm` セクション）
+
+```yaml
+llm:
+  ratio_only: true
+  judgment:
+    n_samples: 3
+    max_tokens: 4096
+    temperature: 0.2     # claude_cli バックエンドは temperature/max_tokens を無視する
+  roles:                 # 用途（role）ごとにバックエンド/モデルを使い分け
+    judgment:       { backend: claude_cli, model: sonnet }
+    weekly_review:  { backend: claude_cli, model: opus }
+    monthly_review: { backend: claude_cli, model: opus }
+  backends:
+    claude_cli:          # Claude Code CLI（サブスクリプション。claude -p をサブプロセス実行）
+      command: claude
+      timeout_seconds: 300
+    local:               # OpenAI 互換 HTTP サーバ（mlx_lm.server / Ollama / LM Studio 等）
+      base_url: "http://127.0.0.1:8080/v1"
+      timeout_seconds: 300
+```
+
+- バックエンド種別は接続設定から推定する（`command`=claude CLI / `base_url`=OpenAI 互換。両方指定・両方未指定は設定エラー）
+- `llm_calls.model` には `"backend:model"`（例 `claude_cli:sonnet`）を記録し、評価プロトコルの期間分離キーとする
 
 ## 10. テスト方針
 
