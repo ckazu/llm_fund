@@ -1,0 +1,198 @@
+"""Tests for config.py: .env + config/*.yaml merging and limits validation."""
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from llm_fund.config import ConfigError, load_settings
+from tests.factories import build_llm_config_dict
+
+VALID_DEFAULT = {
+    "llm": build_llm_config_dict(),
+    "limits": {
+        "max_position_pct": 15.0,
+        "max_turnover_pct": 30.0,
+        "max_instructions_per_day": 5,
+        "require_stop_loss": True,
+    },
+    "benchmark": {"index_symbol": "1306.T", "momentum_lookback_days": 120},
+    "report": {"output_dir": "reports"},
+}
+
+VALID_UNIVERSES = {
+    "universes": {
+        "jp_stocks": {
+            "market": "jp",
+            "report": True,
+            "trade": True,
+            "cadence": "daily",
+            "instruments": [{"symbol": "7203.T", "name": "トヨタ自動車"}],
+        }
+    }
+}
+
+
+def _write_yaml(path: Path, data: dict) -> None:
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+@pytest.fixture
+def config_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "config"
+    d.mkdir()
+    _write_yaml(d / "default.yaml", VALID_DEFAULT)
+    _write_yaml(d / "universes.yaml", VALID_UNIVERSES)
+    return d
+
+
+@pytest.fixture
+def missing_env(tmp_path: Path) -> Path:
+    return tmp_path / "missing.env"
+
+
+class TestLoadSettings:
+    def test_loads_valid_config(self, config_dir: Path, missing_env: Path) -> None:
+        settings = load_settings(config_dir=config_dir, env_file=missing_env)
+
+        assert settings.llm.roles["judgment"].backend == "claude_cli"
+        assert settings.llm.roles["judgment"].model == "sonnet"
+        assert settings.llm.backends["claude_cli"].command == "claude"
+        assert settings.llm.judgment.n_samples == 3
+        assert settings.limits.max_position_pct == 15.0
+        assert settings.benchmark.index_symbol == "1306.T"
+        assert "jp_stocks" in settings.universes
+        assert settings.universes["jp_stocks"].instruments[0].symbol == "7203.T"
+
+    def test_env_secrets_loaded_from_env_file(self, config_dir: Path, tmp_path: Path) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("LOCAL_LLM_API_KEY=sk-local-test\n", encoding="utf-8")
+
+        settings = load_settings(config_dir=config_dir, env_file=env_file)
+
+        assert settings.local_llm_api_key == "sk-local-test"
+
+    def test_role_referencing_undefined_backend_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad_llm = build_llm_config_dict()
+        bad_llm["roles"]["judgment"] = {"backend": "nonexistent", "model": "sonnet"}
+        _write_yaml(config_dir / "default.yaml", {**VALID_DEFAULT, "llm": bad_llm})
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_backend_with_command_and_base_url_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad_llm = build_llm_config_dict()
+        bad_llm["backends"]["claude_cli"]["base_url"] = "http://127.0.0.1:8080/v1"
+        _write_yaml(config_dir / "default.yaml", {**VALID_DEFAULT, "llm": bad_llm})
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_backend_without_command_or_base_url_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad_llm = build_llm_config_dict()
+        bad_llm["backends"]["claude_cli"] = {"timeout_seconds": 300}
+        _write_yaml(config_dir / "default.yaml", {**VALID_DEFAULT, "llm": bad_llm})
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_max_position_pct_over_absolute_cap_is_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad = {**VALID_DEFAULT, "limits": {**VALID_DEFAULT["limits"], "max_position_pct": 26.0}}
+        _write_yaml(config_dir / "default.yaml", bad)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_max_turnover_pct_over_absolute_cap_is_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad = {**VALID_DEFAULT, "limits": {**VALID_DEFAULT["limits"], "max_turnover_pct": 51.0}}
+        _write_yaml(config_dir / "default.yaml", bad)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_max_loss_per_trade_pct_over_absolute_cap_is_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        bad = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_loss_per_trade_pct": 3.1},
+        }
+        _write_yaml(config_dir / "default.yaml", bad)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_configured_max_loss_per_trade_pct_below_cap_loaded(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        ok = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_loss_per_trade_pct": 1.0},
+        }
+        _write_yaml(config_dir / "default.yaml", ok)
+
+        settings = load_settings(config_dir=config_dir, env_file=missing_env)
+
+        assert settings.limits.max_loss_per_trade_pct == 1.0
+
+    def test_limit_exactly_at_absolute_cap_is_accepted(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        ok = {**VALID_DEFAULT, "limits": {**VALID_DEFAULT["limits"], "max_position_pct": 25.0}}
+        _write_yaml(config_dir / "default.yaml", ok)
+
+        settings = load_settings(config_dir=config_dir, env_file=missing_env)
+
+        assert settings.limits.max_position_pct == 25.0
+
+    def test_max_instructions_per_day_over_ticket_capacity_rejected(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        # ticket_no は2桁連番なので1日100件はフォーマット容量を超える。
+        bad = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_instructions_per_day": 100},
+        }
+        _write_yaml(config_dir / "default.yaml", bad)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_max_instructions_per_day_at_capacity_accepted(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        ok = {
+            **VALID_DEFAULT,
+            "limits": {**VALID_DEFAULT["limits"], "max_instructions_per_day": 99},
+        }
+        _write_yaml(config_dir / "default.yaml", ok)
+
+        settings = load_settings(config_dir=config_dir, env_file=missing_env)
+
+        assert settings.limits.max_instructions_per_day == 99
+
+    def test_missing_required_section_raises_config_error(
+        self, config_dir: Path, missing_env: Path
+    ) -> None:
+        incomplete = {k: v for k, v in VALID_DEFAULT.items() if k != "llm"}
+        _write_yaml(config_dir / "default.yaml", incomplete)
+
+        with pytest.raises(ConfigError):
+            load_settings(config_dir=config_dir, env_file=missing_env)
+
+    def test_real_repo_config_files_are_valid(self) -> None:
+        """Guards against the actual config/*.yaml drifting out of schema."""
+        settings = load_settings(env_file=Path(".env.example"))
+
+        assert settings.limits.max_position_pct <= 25.0
+        assert settings.limits.max_turnover_pct <= 50.0

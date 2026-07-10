@@ -1,0 +1,44 @@
+# 非秘匿設定。制限値には src/llm_fund/validator/rules.py の絶対上限が別途かかる
+llm:
+  # 口座残高の実額を LLM に送らず、比率ベースで判断させる
+  ratio_only: true
+  # 自己一致性・LLM 呼び出しパラメータ（technical-spec.md 5章）
+  judgment:
+    n_samples: 3
+    max_tokens: 4096
+    temperature: 0.2   # claude_cli バックエンドは temperature/max_tokens を無視する
+  # 用途（role）ごとのバックエンド/モデル割り当て。役割別に別モデルを使い分けられる
+  roles:
+    judgment:       { backend: claude_cli, model: sonnet }
+    weekly_review:  { backend: claude_cli, model: opus }
+    monthly_review: { backend: claude_cli, model: opus }
+  # バックエンド定義。command=claude CLI（サブスクリプション）/ base_url=OpenAI 互換サーバ
+  backends:
+    claude_cli:
+      command: claude
+      timeout_seconds: 300
+    local:
+      base_url: "http://127.0.0.1:8080/v1"   # mlx_lm.server / Ollama / LM Studio 等
+      timeout_seconds: 300
+
+limits:
+  max_position_pct: 15.0        # 1銘柄の組入上限（%。絶対上限25%以下）
+  max_turnover_pct: 30.0        # 1回の指示での回転率上限（%。絶対上限50%以下）
+  max_loss_per_trade_pct: 3.0   # 1指示の想定損失上限（NAV×%。絶対上限3%以下）
+  max_instructions_per_day: 5
+  require_stop_loss: true       # SL（損切り）未指定の指示は拒否
+
+benchmark:
+  index_symbol: "1306.T"      # TOPIX連動ETF（積立ベンチマーク）
+  momentum_lookback_days: 120 # 単純モメンタムルールのルックバック
+
+# 仮想執行・対照群ベンチマーク共通のコスト/資金条件（全戦略に同一適用）
+tracking:
+  starting_capital: 1000000.0 # 開始資本（全戦略共通）
+  commission_rate: 0.0005     # 手数料率（約定代金の0.05%）
+  min_commission: 0.0         # 最低手数料
+  slippage_pct: 0.001         # スリッページ率（0.1%）
+  random_seed: 42             # ランダム対照群のシード（再現性）
+
+report:
+  output_dir: reports

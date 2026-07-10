@@ -1,0 +1,49 @@
+# 名前付きユニバース定義
+# 各ユニバースは独立した報告・売買対象
+# market: jp | us | global
+# report: true → 日次ブリーフィング生成
+# trade: true → 売買判断・指示生成（初期は1つのみ）
+# cadence: daily | weekly | monthly （レポート生成のタイミング）
+
+universes:
+  jp_stocks:
+    market: jp
+    report: true
+    trade: true
+    cadence: daily
+    instruments:
+      - { symbol: "7203.T", name: "トヨタ自動車" }
+      - { symbol: "6758.T", name: "ソニーグループ" }
+      - { symbol: "8306.T", name: "三菱UFJフィナンシャル・グループ" }
+      - { symbol: "6861.T", name: "キーエンス" }
+      - { symbol: "9984.T", name: "ソフトバンクグループ" }
+      - { symbol: "4063.T", name: "信越化学工業" }
+      - { symbol: "8035.T", name: "東京エレクトロン" }
+      - { symbol: "9433.T", name: "KDDI" }
+      - { symbol: "4502.T", name: "武田薬品工業" }
+      - { symbol: "8058.T", name: "三菱商事" }
+
+  us_stocks:
+    market: us
+    report: true
+    trade: false
+    cadence: daily
+    instruments:
+      - { symbol: "AAPL", name: "Apple Inc." }
+      - { symbol: "MSFT", name: "Microsoft Corporation" }
+      - { symbol: "GOOGL", name: "Alphabet Inc." }
+      - { symbol: "NVDA", name: "NVIDIA Corporation" }
+      - { symbol: "AMZN", name: "Amazon.com Inc." }
+      - { symbol: "TSLA", name: "Tesla Inc." }
+      - { symbol: "META", name: "Meta Platforms Inc." }
+
+  etf:
+    market: global
+    report: true
+    trade: false
+    cadence: weekly
+    instruments:
+      - { symbol: "1306.T", name: "TOPIX連動ETF" }
+      - { symbol: "1321.T", name: "日経225連動ETF" }
+      - { symbol: "SPY", name: "S&P 500 ETF" }
+      - { symbol: "IVV", name: "iShares Core S&P 500 ETF" }

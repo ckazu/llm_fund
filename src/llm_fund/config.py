@@ -1,0 +1,260 @@
+"""Application settings: `.env` (secrets) + `config/*.yaml` (non-secret) merged
+(technical-spec.md 9章).
+
+`limits.*` are validated against the absolute upper bounds in
+`validator/rules.py` at load time. Exceeding them raises `ConfigError`;
+`cli.py` maps that to exit code 3 (設定異常).
+"""
+
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import BaseModel, Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from llm_fund.domain.models import MAX_DAILY_TICKET_SEQUENCE
+from llm_fund.judgment.client import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_N_SAMPLES,
+    DEFAULT_TEMPERATURE,
+)
+from llm_fund.validator.rules import (
+    ABSOLUTE_MAX_LOSS_PER_TRADE_PCT,
+    ABSOLUTE_MAX_POSITION_PCT,
+    ABSOLUTE_MAX_TURNOVER_PCT,
+)
+
+DEFAULT_CONFIG_DIR = Path("config")
+DEFAULT_ENV_FILE = Path(".env")
+DEFAULT_DB_PATH = "llm_fund.db"
+# LLM バックエンド呼び出しの既定タイムアウト（config/default.yaml で上書き可能）。
+DEFAULT_LLM_TIMEOUT_SECONDS = 300
+# 営業日カレンダーを持たないための近似既定値。data/loader.py の既定と合わせる。
+DEFAULT_MAX_STALENESS_DAYS = 4
+
+# --- tracking（仮想執行・ベンチマーク）既定値（technical-spec.md 7章）------------
+# 全戦略（fund / 対照群）に同一適用する開始資本・コスト条件。比較の公平性のため
+# ベンチマーク側にも仮想執行と同じ手数料・スリッページを課す。
+DEFAULT_STARTING_CAPITAL = 1_000_000.0
+DEFAULT_COMMISSION_RATE = 0.0005  # 約定代金の0.05%
+DEFAULT_MIN_COMMISSION = 0.0
+DEFAULT_SLIPPAGE_PCT = 0.001  # 0.1%
+# ランダム対照群のシード（固定して再現可能にする。requirements FR-5）。
+DEFAULT_RANDOM_SEED = 42
+
+
+class ConfigError(Exception):
+    """Raised when configuration is missing/invalid or exceeds absolute limits."""
+
+
+class JudgmentSettings(BaseModel):
+    """自己一致性・LLM 呼び出しパラメータ（technical-spec.md 5章。任意。既定で 3 サンプル）。"""
+
+    n_samples: int = DEFAULT_N_SAMPLES
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+
+    @model_validator(mode="after")
+    def _check_positive(self) -> "JudgmentSettings":
+        if self.n_samples < 1:
+            raise ConfigError(f"llm.judgment.n_samples={self.n_samples} must be >= 1")
+        if self.max_tokens < 1:
+            raise ConfigError(f"llm.judgment.max_tokens={self.max_tokens} must be >= 1")
+        return self
+
+
+class LlmRoleSettings(BaseModel):
+    """1 role（judgment / weekly_review / monthly_review 等）のバックエンド割当。"""
+
+    backend: str
+    model: str
+
+
+class LlmBackendSettings(BaseModel):
+    """1バックエンドの接続設定。
+
+    種別は接続設定から推定する: `base_url` があれば OpenAI 互換 HTTP サーバ
+    （mlx_lm.server / Ollama / LM Studio 等）、`command` があれば claude CLI。
+    両方の指定・どちらも未指定は設定エラー。
+    """
+
+    command: str | None = None
+    base_url: str | None = None
+    timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
+
+    @model_validator(mode="after")
+    def _check_exactly_one_kind(self) -> "LlmBackendSettings":
+        if (self.command is None) == (self.base_url is None):
+            raise ConfigError(
+                "llm.backends の各エントリは command（claude CLI）または "
+                "base_url（OpenAI 互換サーバ）のどちらか一方のみを指定する"
+            )
+        if self.timeout_seconds < 1:
+            raise ConfigError(
+                f"llm.backends.timeout_seconds={self.timeout_seconds} must be >= 1"
+            )
+        return self
+
+
+class LLMSettings(BaseModel):
+    """LLM 層の設定: プラガブルなバックエンド定義と role 別ルーティング。"""
+
+    ratio_only: bool = True
+    judgment: JudgmentSettings = Field(default_factory=JudgmentSettings)
+    roles: dict[str, LlmRoleSettings]
+    backends: dict[str, LlmBackendSettings]
+
+    @model_validator(mode="after")
+    def _check_role_backends_defined(self) -> "LLMSettings":
+        for role, conf in self.roles.items():
+            if conf.backend not in self.backends:
+                raise ConfigError(
+                    f"llm.roles.{role} が未定義の backend {conf.backend!r} を参照している"
+                    f"（定義済み: {sorted(self.backends)}）"
+                )
+        return self
+
+
+class LimitsSettings(BaseModel):
+    max_position_pct: float
+    max_turnover_pct: float
+    max_instructions_per_day: int
+    require_stop_loss: bool = True
+    # 1指示の想定損失上限（NAV×%）。絶対上限以下で運用者が保守化できる
+    # （technical-spec.md 6章 MaxLossPerTrade「NAV×設定%（≤絶対上限）」）。既定は絶対上限。
+    max_loss_per_trade_pct: float = ABSOLUTE_MAX_LOSS_PER_TRADE_PCT
+
+    @model_validator(mode="after")
+    def _check_absolute_caps(self) -> "LimitsSettings":
+        if self.max_position_pct > ABSOLUTE_MAX_POSITION_PCT:
+            raise ConfigError(
+                f"limits.max_position_pct={self.max_position_pct} exceeds absolute "
+                f"cap {ABSOLUTE_MAX_POSITION_PCT}"
+            )
+        if self.max_loss_per_trade_pct > ABSOLUTE_MAX_LOSS_PER_TRADE_PCT:
+            raise ConfigError(
+                f"limits.max_loss_per_trade_pct={self.max_loss_per_trade_pct} exceeds "
+                f"absolute cap {ABSOLUTE_MAX_LOSS_PER_TRADE_PCT}"
+            )
+        if self.max_loss_per_trade_pct <= 0:
+            raise ConfigError(
+                f"limits.max_loss_per_trade_pct={self.max_loss_per_trade_pct} must be > 0"
+            )
+        if self.max_turnover_pct > ABSOLUTE_MAX_TURNOVER_PCT:
+            raise ConfigError(
+                f"limits.max_turnover_pct={self.max_turnover_pct} exceeds absolute "
+                f"cap {ABSOLUTE_MAX_TURNOVER_PCT}"
+            )
+        if self.max_instructions_per_day < 1:
+            raise ConfigError(
+                f"limits.max_instructions_per_day={self.max_instructions_per_day} must be >= 1"
+            )
+        if self.max_instructions_per_day > MAX_DAILY_TICKET_SEQUENCE:
+            raise ConfigError(
+                f"limits.max_instructions_per_day={self.max_instructions_per_day} exceeds the "
+                f"daily ticket capacity {MAX_DAILY_TICKET_SEQUENCE}（ticket_no は2桁連番）"
+            )
+        return self
+
+
+class BenchmarkSettings(BaseModel):
+    index_symbol: str
+    momentum_lookback_days: int
+
+
+class TrackingSettings(BaseModel):
+    """仮想執行エンジン・対照群ベンチマーク共通のコスト/資金条件（technical-spec.md 7章）。"""
+
+    starting_capital: float = DEFAULT_STARTING_CAPITAL
+    commission_rate: float = DEFAULT_COMMISSION_RATE
+    min_commission: float = DEFAULT_MIN_COMMISSION
+    slippage_pct: float = DEFAULT_SLIPPAGE_PCT
+    random_seed: int = DEFAULT_RANDOM_SEED
+
+    @model_validator(mode="after")
+    def _check_non_negative(self) -> "TrackingSettings":
+        if self.starting_capital <= 0:
+            raise ConfigError(
+                f"tracking.starting_capital={self.starting_capital} must be > 0"
+            )
+        for name in ("commission_rate", "min_commission", "slippage_pct"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ConfigError(f"tracking.{name}={value} must be >= 0")
+        return self
+
+
+class ReportSettings(BaseModel):
+    output_dir: str
+
+
+class DataSettings(BaseModel):
+    max_staleness_days: int = DEFAULT_MAX_STALENESS_DAYS
+
+
+class UniverseInstrumentConfig(BaseModel):
+    symbol: str
+    name: str
+
+
+class UniverseConfig(BaseModel):
+    market: str
+    report: bool = True
+    trade: bool = False
+    cadence: str = "daily"
+    instruments: list[UniverseInstrumentConfig] = Field(default_factory=list)
+
+
+class AppSettings(BaseSettings):
+    """Merged application configuration.
+
+    Secrets (`local_llm_api_key`, `notify_webhook_url`) come from `.env`;
+    everything else comes from `config/default.yaml` + `config/universes.yaml`.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+
+    # OpenAI 互換ローカルバックエンドが認証を要求する構成向け（任意）。
+    local_llm_api_key: str | None = None
+    notify_webhook_url: str | None = None
+    db_path: str = DEFAULT_DB_PATH
+
+    llm: LLMSettings
+    limits: LimitsSettings
+    benchmark: BenchmarkSettings
+    report: ReportSettings
+    data: DataSettings = Field(default_factory=DataSettings)
+    tracking: TrackingSettings = Field(default_factory=TrackingSettings)
+    universes: dict[str, UniverseConfig]
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_settings(
+    config_dir: Path = DEFAULT_CONFIG_DIR,
+    env_file: Path = DEFAULT_ENV_FILE,
+) -> AppSettings:
+    """Load and validate settings from `.env` + `config/*.yaml`.
+
+    Raises `ConfigError` if required config is missing/malformed, or `limits`
+    exceed the absolute caps in `validator/rules.py`.
+    """
+    default_conf = _load_yaml(config_dir / "default.yaml")
+    universes_conf = _load_yaml(config_dir / "universes.yaml").get("universes", {})
+    merged = {**default_conf, "universes": universes_conf}
+
+    try:
+        return AppSettings(
+            _env_file=env_file if env_file.exists() else None,  # type: ignore[call-arg]
+            **merged,
+        )
+    except ConfigError:
+        raise
+    except Exception as exc:
+        raise ConfigError(str(exc)) from exc
